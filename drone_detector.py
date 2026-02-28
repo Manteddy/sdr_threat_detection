@@ -347,6 +347,19 @@ class DroneDetector(QMainWindow):
         ctrl.addWidget(self.threshold_label)
 
         ctrl.addSpacing(15)
+        ctrl.addWidget(self._lbl("Gain:"))
+        self.gain_slider = QSlider(Qt.Horizontal)
+        self.gain_slider.setRange(0, 73)
+        self.gain_slider.setValue(40)
+        self.gain_slider.setMaximumWidth(120)
+        self.gain_slider.valueChanged.connect(self._on_gain)
+        ctrl.addWidget(self.gain_slider)
+        self.gain_label = QLabel("40 dB")
+        self.gain_label.setFixedWidth(45)
+        self.gain_label.setStyleSheet("color:#aaa;")
+        ctrl.addWidget(self.gain_label)
+
+        ctrl.addSpacing(15)
         ctrl.addWidget(self._lbl("WF Depth:"))
         self.wf_depth_spin = QSpinBox()
         self.wf_depth_spin.setRange(50, 1000)
@@ -605,7 +618,7 @@ class DroneDetector(QMainWindow):
             self.sdr.sample_rate = SAMPLE_RATE
             self.sdr.rx_buffer_size = FFT_SIZE * 4
             self.sdr.gain_control_mode_chan0 = "manual"
-            self.sdr.rx_hardwaregain_chan0 = 40
+            self.sdr.rx_hardwaregain_chan0 = self.gain_slider.value()
 
             # Detect how many RX channels the IIO context exposes
             n_rx_ch = 0
@@ -626,7 +639,7 @@ class DroneDetector(QMainWindow):
                 try:
                     self.sdr.rx_enabled_channels = [0, 1]
                     self.sdr.gain_control_mode_chan1 = "manual"
-                    self.sdr.rx_hardwaregain_chan1 = 40
+                    self.sdr.rx_hardwaregain_chan1 = self.gain_slider.value()
 
                     # Verify with multiple reads
                     n_identical = 0
@@ -734,6 +747,16 @@ class DroneDetector(QMainWindow):
         self.warning_counters = {f: 0 for f in self.monitor_freqs_ghz}
 
     # ------------------------------------------------------------ Events
+    def _on_gain(self, val):
+        self.gain_label.setText(f"{val} dB")
+        if self.sdr and self.connected:
+            try:
+                self.sdr.rx_hardwaregain_chan0 = val
+                if self.dual_channel:
+                    self.sdr.rx_hardwaregain_chan1 = val
+            except Exception:
+                pass
+
     def _on_threshold(self, val):
         self.threshold_label.setText(f"{val} dBFS")
         if hasattr(self, "thresh_line_omni"):
