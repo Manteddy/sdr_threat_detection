@@ -35,6 +35,9 @@ from PyQt5.QtCore import QTimer, Qt, QRectF, QThread, pyqtSignal
 from PyQt5.QtGui import QFont
 import pyqtgraph as pg
 
+from proximity_alert.engine import AlertEngine
+from proximity_alert.widget import ProximityAlertPanel
+
 # ---- Optional acceleration ----
 HAS_NUMBA = False
 try:
@@ -57,7 +60,7 @@ DEFAULT_WF_LINES = 200
 WATERFALL_COLS   = 800
 
 MONITOR_HISTORY_LEN = 300
-DEFAULT_MONITORS = [5.800, 5.900, 5.920]
+DEFAULT_MONITORS = [5.650, 5.900, 5.920]
 DEFAULT_THRESHOLD_DBFS = -40
 WARNING_PERSIST_COUNT = 2
 
@@ -508,6 +511,7 @@ class DroneDetector(QMainWindow):
         self._setup_ui()
         self._setup_plots()
         self._setup_crosshairs()
+        self._setup_alert_window()
 
         self.sweep_worker = SweepWorker()
         self.sweep_worker.sweep_done.connect(self._on_sweep_done)
@@ -764,7 +768,7 @@ class DroneDetector(QMainWindow):
         self.monitor_input = QLineEdit(
             ", ".join(f"{f:.3f}" for f in self.monitor_freqs_ghz)
         )
-        self.monitor_input.setPlaceholderText("5.800, 5.900, 5.920")
+        self.monitor_input.setPlaceholderText("5.650, 5.900, 5.920")
         self.monitor_input.setStyleSheet(INPUT_STYLE)
         self.monitor_input.setFixedWidth(300)
         mon_ctrl.addWidget(self.monitor_input)
@@ -953,6 +957,36 @@ class DroneDetector(QMainWindow):
             )
             self._crosshair_proxies.extend([pw, ps])
 
+    # ----------------------------------------------- Separate alert window
+    def _setup_alert_window(self):
+        self.alert_engine = AlertEngine(
+            enter_m=DIST_ENTER_M,
+            exit_m=DIST_EXIT_M,
+            detection_threshold_dbfs=float(DEFAULT_THRESHOLD_DBFS),
+            critical_m=100.0,
+            approaching_m=250.0,
+        )
+        self._alert_window = QMainWindow()
+        self._alert_window.setWindowTitle("Proximity Alert")
+        self._alert_window.setMinimumSize(520, 260)
+        self._alert_window.setStyleSheet("background:#0e0e1a;")
+
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(6, 6, 6, 6)
+
+        header = QLabel("PROXIMITY ALERT")
+        header.setFont(QFont("Segoe UI", 10))
+        header.setAlignment(Qt.AlignCenter)
+        header.setStyleSheet("color:#666;padding:4px;")
+        layout.addWidget(header)
+
+        self.alert_panel = ProximityAlertPanel(self.alert_engine)
+        layout.addWidget(self.alert_panel)
+
+        self._alert_window.setCentralWidget(container)
+        self._alert_window.show()
+
     # -------------------------------------------------------- Connection
     def try_connect(self):
         try:
@@ -1112,6 +1146,7 @@ class DroneDetector(QMainWindow):
         self.status_label.setStyleSheet("color:#888;")
         self.warning_label.setText("")
         self.warning_label.setStyleSheet("color:transparent;")
+        self.alert_panel.clear()
 
     def _reset_buffers(self):
         self.spectrum_omni[:] = DB_MIN
@@ -1367,6 +1402,22 @@ class DroneDetector(QMainWindow):
             if use_dist and freq in self.distance_estimators:
                 best_power = max(peak_o, peak_d)
                 self.distance_estimators[freq].update(best_power)
+
+            de = self.distance_estimators.get(freq)
+            if detected:
+                self.alert_panel.push(
+                    freq_ghz=freq,
+                    signal_dbfs=max(peak_o, peak_d),
+                    distance_m=de.x if (use_dist and de) else None,
+                    confidence=de.confidence if (use_dist and de) else 0.0,
+                )
+            else:
+                self.alert_panel.push(
+                    freq_ghz=freq,
+                    signal_dbfs=DB_MIN,
+                    distance_m=None,
+                    confidence=0.0,
+                )
 
     def _on_sweep_error(self, msg):
         self.status_label.setText(f"Sweep error: {msg}")
