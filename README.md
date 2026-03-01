@@ -4,15 +4,27 @@ Python application that uses a PlutoSDR (or AD9361-based SDR) to detect FPV dron
 
 ---
 
-## Summary
+## Two Versions
 
-This is a **PyQt5-based FPV drone detector** for **PlutoSDR** (and AD9361-based SDRs). It:
+| File | Description |
+|------|-------------|
+| `drone_detector.py` | **Simple** ? single FFT, fixed threshold, fast sweep |
+| `drone_detector_enhanced.py` | **Enhanced** ? adds CFAR, adaptive baseline, distance estimation |
 
-- **Sweeps** a configurable frequency band (default 5.66.0 GHz)
-- Displays **spectrum** and **waterfall** views (SDR++ style)
-- **Monitors** specific frequencies with strength-over-time plots
-- **Alerts** when signals exceed a configurable threshold
-- Supports **dual-channel** (omni + directional) when hardware has MIMO
+Both share identical acquisition code (single `rx()`, single FFT, same buffer/timing) so spectrum and waterfall look the same.
+
+---
+
+## Enhanced Features
+
+- **CA-CFAR detection** ? adaptive threshold that tracks local noise per frequency bin; clearly separates real spikes from ground noise
+- **Adaptive noise baseline** ? slow-tracking floor estimate that prevents signal contamination of noise reference
+- **Distance estimation** ? log-distance path loss model + Kalman filter converts signal power to estimated range with confidence score
+- **Proximity hysteresis** ? enter/exit thresholds (default 95 m / 120 m) prevent warning chatter near boundary
+- **Optional Numba JIT** ? accelerates CFAR loops when `numba` is installed
+- **AD9361 fastlock** ? opt-in profile-based retuning (off by default; can cause artifacts on some hardware)
+
+All enhanced features have runtime toggles (checkboxes in the UI) and fall back gracefully to fixed-threshold detection.
 
 ---
 
@@ -20,87 +32,63 @@ This is a **PyQt5-based FPV drone detector** for **PlutoSDR** (and AD9361-based 
 
 ### 1. Startup
 
-```
-main() ’ DroneDetector window ’ UI setup ’ Plots & crosshairs
-```
-
 - Creates main window with dark theme
-- Initializes sweep range (5.66.0 GHz), monitor frequencies (5.800, 5.900, 5.920 GHz), and threshold (-40 dBFS)
+- Initializes sweep range (5.6?6.0 GHz), monitor frequencies (5.800, 5.900, 5.920 GHz), threshold (-40 dBFS)
 - Sets up spectrum + waterfall plots for RX1 (omni) and RX2 (directional)
 - Adds interactive crosshairs for frequency/dB readout on hover
 
----
-
 ### 2. Connection
 
-```
-Connect ’ adi.ad9361 / Pluto ’ Configure SDR ’ Start SweepWorker
-```
-
 - Tries `ad9361` (IP) first, then `Pluto` (USB)
-- Configures bandwidth (20 MHz), sample rate (20 MHz), gain, buffer size
+- Configures bandwidth (20 MHz), sample rate (20 MHz), gain, buffer size (2048)
 - Detects dual-channel support (4+ IIO RX channels)
 - Starts `SweepWorker` thread and display update timer (~80 ms)
 
----
-
 ### 3. Sweep Loop (Background Thread)
 
-```
-SweepWorker.run() ’ For each step:
-  1. Set LO frequency
-  2. Wait PLL settle (0.8 ms)
-  3. rx() ’ IQ samples
-  4. FFT (Blackman window) ’ dB
-  5. Fill spectrum_omni / spectrum_dir
-  6. After full sweep ’ downsample to 800 cols ’ emit sweep_done
-```
+For each frequency step:
+1. Set LO + wait 0.8 ms for PLL lock
+2. `rx()` ? IQ samples (2048 complex samples)
+3. Single FFT with Blackman window ? dBFS spectrum (512 bins)
+4. Fill `spectrum_omni` / `spectrum_dir`
+5. After full sweep ? downsample to 800 cols ? emit `sweep_done`
 
-- Steps in 20 MHz increments across the band
-- Per step: set LO, capture IQ, FFT, convert to dB, store in shared arrays
-- After full sweep, downsamples to 800 columns and emits `sweep_done`
-
----
-
-### 4. Sweep Results (Main Thread)
+### 4. Sweep Results (Main Thread, Enhanced Only)
 
 ```
-_on_sweep_done() ’
+_on_sweep_done() ?
   - Append waterfall lines
-  - For each monitor freq: max dB in ±25 bins ’ history
-  - Update warning counters (above/below threshold)
+  - Update adaptive noise baseline (slow EWMA, signal-resistant)
+  - Compute CFAR threshold array for full spectrum
+  - For each monitor freq:
+      - CFAR detection around ï¿½25 bins
+      - Hybrid decision: CFAR OR fixed threshold (safety fallback)
+      - Update distance estimator (Kalman filter)
+      - Update warning counters with hysteresis
 ```
-
-- Appends new lines to waterfall deques
-- For each monitor frequency, extracts max dB in ±25-bin window and appends to history
-- Increments/decrements warning counters based on threshold
-
----
 
 ### 5. Display Update (Timer, ~80 ms)
 
-```
-_update_display() ’
-  - Current LO frequency label
-  - Warning label if any monitor above threshold
-  - Spectrum curves
-  - Waterfall images (normalized to noise floor)
-  - Monitor mini-plots (strength vs sweep #)
-```
-
-- Updates status, spectrum, waterfall, and monitor plots
-- Shows warning when a monitor stays above threshold for several sweeps
+- Current LO frequency label
+- Warning label (proximity or signal alert)
+- Spectrum curves + CFAR threshold overlay (yellow dash-dot)
+- Waterfall images (normalized to noise floor)
+- Monitor mini-plots (strength vs sweep #)
+- Distance estimate + confidence per monitor frequency
 
 ---
 
-### 6. User Controls
+## User Controls
 
 | Control | Effect |
-|--------|--------|
+|---------|--------|
 | **Sweep range** | Start/end GHz; Apply recomputes steps and restarts sweep |
-| **Threshold** | dBFS level for alerts (-100 to -10) |
-| **Gain** | RX gain 073 dB |
-| **WF Depth** | Waterfall history length (501000 lines) |
+| **Threshold** | dBFS level for fixed-threshold fallback (-100 to -10) |
+| **Gain** | RX gain 0?73 dB |
+| **WF Depth** | Waterfall history length (50?1000 lines) |
+| **CFAR Scale** | dB above local noise for CFAR detection (1?20 dB) |
+| **CFAR** | Toggle adaptive CFAR detection on/off |
+| **Distance Est.** | Toggle distance estimation on/off |
 | **Monitor frequencies** | Comma-separated GHz values to track |
 
 ---
@@ -108,9 +96,13 @@ _update_display() ’
 ## Data Flow
 
 ```
-SDR (IQ) ’ FFT ’ dB spectrum ’ [spectrum plot, waterfall, monitor history]
-                                    “
-                            Threshold check ’ Warning display
+SDR (IQ) ? single FFT ? dB spectrum ? [spectrum plot, waterfall]
+                                           ?
+                                     CFAR threshold ? detection decision
+                                           ?
+                                     Kalman filter ? distance estimate
+                                           ?
+                                     Hysteresis ? Warning display
 ```
 
 ---
@@ -119,32 +111,22 @@ SDR (IQ) ’ FFT ’ dB spectrum ’ [spectrum plot, waterfall, monitor history]
 
 | Component | Role |
 |-----------|------|
-| **SweepWorker** | Background thread that runs the SDR sweep and FFT |
-| **DroneDetector** | Main window, UI, and display logic |
-| **spectrum_omni / spectrum_dir** | Shared arrays for RX1/RX2 spectrum |
-| **waterfall_omni / waterfall_dir** | Deques of recent sweep lines |
-| **monitor_history** | Per-frequency strength history for mini-plots |
-| **warning_counters** | Hysteresis to avoid flickering alerts |
-
----
-
-## Features
-
-- **Frequency sweep**: 5.66.0 GHz (configurable; stock Pluto: 325 MHz3.8 GHz)
-- **Dual antenna display**: Omni and directional (requires Pluto 2r2t firmware or AD9361 MIMO)
-- **Live warning**: Red alert when strong signal detected at monitor frequencies
-- **Waterfall**: Shows signal strength over time (approaching drone = stronger)
-- **Monitor panel**: Strength-over-time plots for user-defined frequencies
+| **SweepWorker** | Background thread: SDR sweep, single FFT per step |
+| **DroneDetector** | Main window: UI, CFAR, baseline, distance model, display |
+| **cfar_threshold()** | Vectorized CA-CFAR with optional Numba dispatch |
+| **cfar_detect_at_bin()** | Per-monitor-frequency CFAR detection |
+| **DistanceEstimator** | Log-distance path loss + Kalman filter + hysteresis |
+| **FastlockManager** | AD9361 fastlock profile setup and recall (opt-in) |
 
 ---
 
 ## Requirements
 
 - PlutoSDR (ADALM-PLUTO) or AD9361-based SDR connected via USB or IP
-- PlutoSDR USB drivers installed ([plutosdr-m2k-drivers-win](https://github.com/analogdevicesinc/plutosdr-m2k-drivers-win))
+- PlutoSDR USB drivers installed
 - Python 3.8+
 
-**Note:** Stock PlutoSDR is 325 MHz3.8 GHz. For 5.8 GHz, use Pluto+ (AD9363) or a modified unit.
+**Note:** Stock PlutoSDR is 325 MHz?3.8 GHz. For 5.8 GHz, use Pluto+ (AD9363) or a modified unit.
 
 ---
 
@@ -154,20 +136,40 @@ SDR (IQ) ’ FFT ’ dB spectrum ’ [spectrum plot, waterfall, monitor history]
 pip install -r requirements.txt
 ```
 
-On Windows, ensure [libiio](https://github.com/analogdevicesinc/libiio) is available (often via pyadi-iio).
+Optional acceleration (recommended):
+
+```bash
+pip install numba
+```
 
 ---
 
 ## Usage
 
 ```bash
-python drone_detector.py
+python drone_detector.py           # simple version
+python drone_detector_enhanced.py  # enhanced version
 ```
 
 1. Click **Connect**
 2. Adjust sweep range, threshold, and gain if needed
-3. Add monitor frequencies (e.g. `5.800, 5.900, 5.920`)
-4. Watch spectrum and waterfall; red warning appears when a strong signal is detected at monitor frequencies
+3. Toggle **CFAR** and **Distance Est.** features as desired
+4. Tune **CFAR Scale** (higher = fewer false alarms, lower = more sensitive)
+5. Add monitor frequencies (e.g. `5.800, 5.900, 5.920`)
+6. Watch spectrum and waterfall; yellow curve shows CFAR threshold; red warning for signals; dark red for proximity
+
+---
+
+## Distance Calibration
+
+The distance model uses default parameters (reference power -30 dBFS at 10 m, path loss exponent 2.2). For accurate 100 m boundary warnings:
+
+1. Place a known FPV transmitter at a measured distance (e.g. 10 m)
+2. Note the peak dBFS reading at that distance
+3. Update `DIST_REF_POWER_DBFS` and `DIST_REF_DISTANCE_M` constants in `drone_detector_enhanced.py`
+4. Repeat at 50 m and 100 m; adjust `DIST_PATH_LOSS_EXP` to fit
+
+Without calibration, distance estimates are approximate and environment-dependent.
 
 ---
 
