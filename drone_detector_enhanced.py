@@ -38,6 +38,17 @@ import pyqtgraph as pg
 from proximity_alert.engine import AlertEngine
 from proximity_alert.widget import ProximityAlertPanel
 
+# ---- Adaptive Spectrum Sensing Engine ----
+try:
+    from spectrum_engine import SpectrumEngine, EngineSnapshot
+    from spectrum_engine.sdr_backend import SDRBackend
+    from spectrum_engine.config import load_config as _load_engine_config
+    from spectrum_engine.tracks import TrackState
+    HAS_ENGINE = True
+except Exception as _eng_err:
+    HAS_ENGINE = False
+    _eng_err_msg = str(_eng_err)
+
 # ---- Optional acceleration ----
 HAS_NUMBA = False
 try:
@@ -47,7 +58,7 @@ except ImportError:
     pass
 
 # ---- Default Configuration (matches simple detector) ----
-DEFAULT_START_GHZ = 5.6
+DEFAULT_START_GHZ = 1.2
 DEFAULT_END_GHZ   = 6.0
 BANDWIDTH_HZ   = 20_000_000
 SAMPLE_RATE    = 20_000_000
@@ -116,6 +127,27 @@ FEATURES = {
     "use_fastlock": False,
 }
 
+# ---- UI panels ----
+# Monitor-frequency panel is superseded by the Spectrum Activity Maps when the
+# adaptive engine is in use. Set to True to restore the old per-frequency panel.
+SHOW_MONITOR_PANEL = False
+
+# Scan-coverage "fire up" glow: wall-clock decay time-constant (seconds).
+# A freshly scanned cell flares to 1.0 and fades to 1/e after this many seconds.
+# Kept short so frequently-revisited bands (e.g. an active 2.4 GHz, hit every
+# ~0.3 s) stay bright while the once-per-sweep coverage trail (~5 s) fades to
+# dark -> drastic contrast between often-revisited and rarely-visited bands.
+SCAN_HEAT_TAU_S = 2.5
+
+# Perceptual gamma applied to the scan-coverage heat for display only. gamma < 1
+# keeps partially-faded (recently-but-not-just scanned) cells clearly visible.
+SCAN_DISPLAY_GAMMA = 0.5
+
+# Perceptual gamma applied to the probability map for display only (does NOT
+# change detection). gamma < 1 lifts low-but-nonzero probabilities so a band
+# that is starting to show activity is clearly visible instead of dark blue.
+PROB_DISPLAY_GAMMA = 0.5
+
 
 # ---------------------------------------------------------------- Utilities
 def _welch_psd_db(iq, fft_size=FFT_SIZE, overlap_frac=WELCH_OVERLAP_FRAC):
@@ -153,6 +185,24 @@ def _sdr_colormap():
     colors = [
         (0, 0, 20), (0, 0, 100), (0, 50, 180), (0, 160, 220),
         (0, 200, 80), (200, 220, 0), (255, 80, 0), (255, 0, 0), (255, 200, 200),
+    ]
+    return pg.ColorMap(np.linspace(0, 1, len(colors)), colors).getLookupTable(0, 1, 256)
+
+
+def _probability_colormap():
+    """LUT for the activity-probability map: dark-blue -> cyan -> yellow -> red."""
+    colors = [
+        (10, 10, 35), (0, 60, 140), (0, 160, 200),
+        (40, 210, 120), (220, 220, 0), (255, 110, 0), (255, 0, 0),
+    ]
+    return pg.ColorMap(np.linspace(0, 1, len(colors)), colors).getLookupTable(0, 1, 256)
+
+
+def _scan_colormap():
+    """LUT for the scan-coverage tracker: black -> orange -> white (cold -> just scanned)."""
+    colors = [
+        (8, 8, 16), (60, 30, 0), (160, 80, 0),
+        (255, 150, 0), (255, 220, 120), (255, 255, 255),
     ]
     return pg.ColorMap(np.linspace(0, 1, len(colors)), colors).getLookupTable(0, 1, 256)
 
@@ -351,8 +401,16 @@ class FastlockManager:
 
 # ------------------------------------------------------------ Sweep Thread
 class SweepWorker(QThread):
-    """Runs the SDR sweep loop — acquisition identical to simple detector."""
+    """
+    Runs the SDR acquisition loop.
+
+    When a SpectrumEngine is attached (via configure_engine), it runs the
+    adaptive engine.step() loop and emits engine_update snapshots.
+    Otherwise it falls back to the classic fixed-step sweep for backward
+    compatibility and emits sweep_done as before.
+    """
     sweep_done = pyqtSignal(object, object, float)
+    engine_update = pyqtSignal(object)   # carries an EngineSnapshot
     error_occurred = pyqtSignal(str)
 
     def __init__(self):
@@ -371,6 +429,10 @@ class SweepWorker(QThread):
         self.features = dict(FEATURES)
         self.fastlock = FastlockManager()
 
+        # Engine-mode state
+        self._engine = None
+        self._backend = None
+
     def configure(self, sdr, start_hz, num_steps, dual, spec_omni, spec_dir,
                   spec_omni_welch=None, spec_dir_welch=None,
                   features=None, fastlock=None):
@@ -387,8 +449,88 @@ class SweepWorker(QThread):
         if fastlock is not None:
             self.fastlock = fastlock
 
+    def configure_engine(self, engine, backend):
+        """Attach a SpectrumEngine + SDRBackend to use the adaptive scan loop."""
+        self._engine = engine
+        self._backend = backend
+
     def run(self):
         self._running = True
+
+        if self._engine is not None and self._backend is not None:
+            self._run_engine_loop()
+        else:
+            self._run_classic_loop()
+
+    def _run_engine_loop(self):
+        """Adaptive engine-driven scan loop (Phases 1-3)."""
+        engine = self._engine
+        last_emit = 0.0
+        # Cap the snapshot emit rate so the (heavy) GUI slot never falls behind
+        # the engine and renders stale state. The snapshot is cumulative, so
+        # skipped steps lose nothing: each cell's scan age is read from the
+        # engine's actual last_scan_time, which persists across steps.
+        emit_interval = 1.0 / 20.0
+        while self._running:
+            try:
+                now = time.monotonic()
+                snapshot = engine.step(now=now)
+
+                # Update current_freq for the freq_label
+                if snapshot.last_command is not None:
+                    self.current_freq = int(snapshot.last_command.center_hz)
+
+                # Also keep the classic spectrum buffers updated from the
+                # engine's rolling display PSD so the waterfall still works.
+                self._fill_classic_buffers_from_snapshot(snapshot)
+
+                if (now - last_emit) >= emit_interval:
+                    self.engine_update.emit(snapshot)
+                    last_emit = now
+
+            except Exception as e:
+                self.error_occurred.emit(str(e)[:80])
+                time.sleep(0.1)
+
+    def _fill_classic_buffers_from_snapshot(self, snapshot):
+        """
+        Copy the engine's full-spectrum display PSD into the shared spectrum_omni
+        buffer so the existing waterfall rendering path keeps working.
+        """
+        if self.spectrum_omni is None:
+            return
+        try:
+            psd = snapshot.last_psd_db
+            freq = snapshot.last_psd_freq_hz
+            if len(psd) == 0 or len(freq) == 0:
+                return
+
+            lo_hz = freq[0]
+            hi_hz = freq[-1]
+            total = len(self.spectrum_omni)
+
+            # Compute the slice of the classic buffer that this PSD covers
+            span_start = self.sweep_start_hz
+            step_hz = SWEEP_STEP_HZ
+            # Map measured freq range to buffer indices
+            lo_idx = max(0, int((lo_hz - span_start) / step_hz * BINS_PER_STEP))
+            hi_idx = min(total, int((hi_hz - span_start) / step_hz * BINS_PER_STEP) + 1)
+            if hi_idx <= lo_idx:
+                return
+
+            dest_slice = hi_idx - lo_idx
+            interp_psd = np.interp(
+                np.linspace(lo_hz, hi_hz, dest_slice),
+                freq, psd,
+            ).astype(np.float32)
+            self.spectrum_omni[lo_idx:hi_idx] = interp_psd
+            if self.spectrum_dir is not None:
+                self.spectrum_dir[lo_idx:hi_idx] = interp_psd
+        except Exception:
+            pass
+
+    def _run_classic_loop(self):
+        """Original fixed-step sweep loop (fallback / backward compat)."""
         while self._running and self.sdr:
             self.current_freq = self.sweep_start_hz
             self.sweep_col = 0
@@ -503,6 +645,15 @@ class DroneDetector(QMainWindow):
         self.distance_estimators = {}
         self.cfar_scale_db = CFAR_SCALE_DB
 
+        # Engine state
+        self._engine = None
+        self._engine_backend = None
+        self._engine_scan_count = 0
+
+        # Scan-coverage "fire up" heat buffer (lazily sized on first snapshot)
+        self._scan_heat = None
+        self._last_map_time = None
+
         self._recalc_sweep()
         self._init_monitor_history()
 
@@ -515,6 +666,7 @@ class DroneDetector(QMainWindow):
 
         self.sweep_worker = SweepWorker()
         self.sweep_worker.sweep_done.connect(self._on_sweep_done)
+        self.sweep_worker.engine_update.connect(self._on_engine_update)
         self.sweep_worker.error_occurred.connect(self._on_sweep_error)
         self.update_timer = QTimer(self)
         self.update_timer.timeout.connect(self._update_display)
@@ -728,6 +880,32 @@ class DroneDetector(QMainWindow):
         ctrl2.addStretch()
         root.addLayout(ctrl2)
 
+        # ---- Engine status bar ----
+        if HAS_ENGINE:
+            eng_bar = QHBoxLayout()
+            eng_bar.addWidget(self._lbl("Engine:"))
+            self.engine_status_label = QLabel("Idle")
+            self.engine_status_label.setFont(QFont("Consolas", 8))
+            self.engine_status_label.setStyleSheet("color:#666;padding:1px 4px;")
+            eng_bar.addWidget(self.engine_status_label)
+
+            self.engine_coverage_label = QLabel("")
+            self.engine_coverage_label.setFont(QFont("Consolas", 8))
+            self.engine_coverage_label.setStyleSheet("color:#666;padding:1px 4px;")
+            eng_bar.addWidget(self.engine_coverage_label)
+
+            self.engine_tracks_label = QLabel("")
+            self.engine_tracks_label.setFont(QFont("Consolas", 8))
+            self.engine_tracks_label.setStyleSheet("color:#0ff;padding:1px 4px;")
+            eng_bar.addWidget(self.engine_tracks_label)
+
+            eng_bar.addStretch()
+            root.addLayout(eng_bar)
+        else:
+            self.engine_status_label = None
+            self.engine_coverage_label = None
+            self.engine_tracks_label = None
+
         # ---- Main vertical splitter: spectrum/waterfall vs monitor panel ----
         main_vsplit = QSplitter(Qt.Vertical)
 
@@ -755,50 +933,169 @@ class DroneDetector(QMainWindow):
 
         main_vsplit.addWidget(hsplit)
 
-        # Monitor panel
-        mon_group = QGroupBox("Monitor Frequencies")
-        mon_group.setStyleSheet(
-            "QGroupBox{color:#aaa;border:1px solid #333;margin-top:4px;}"
-            "QGroupBox::title{padding:0 4px;}"
-        )
-        mon_outer = QVBoxLayout()
+        # Monitor panel (legacy; hidden when SHOW_MONITOR_PANEL is False)
+        if SHOW_MONITOR_PANEL:
+            mon_group = QGroupBox("Monitor Frequencies")
+            mon_group.setStyleSheet(
+                "QGroupBox{color:#aaa;border:1px solid #333;margin-top:4px;}"
+                "QGroupBox::title{padding:0 4px;}"
+            )
+            mon_outer = QVBoxLayout()
 
-        mon_ctrl = QHBoxLayout()
-        mon_ctrl.addWidget(self._lbl("Frequencies (GHz):"))
-        self.monitor_input = QLineEdit(
-            ", ".join(f"{f:.3f}" for f in self.monitor_freqs_ghz)
-        )
-        self.monitor_input.setPlaceholderText("5.650, 5.900, 5.920")
-        self.monitor_input.setStyleSheet(INPUT_STYLE)
-        self.monitor_input.setFixedWidth(300)
-        mon_ctrl.addWidget(self.monitor_input)
-        mon_apply = QPushButton("Apply")
-        mon_apply.setFixedWidth(55)
-        mon_apply.setStyleSheet(BTN_STYLE)
-        mon_apply.clicked.connect(self._apply_monitors)
-        mon_ctrl.addWidget(mon_apply)
-        mon_ctrl.addStretch()
-        mon_outer.addLayout(mon_ctrl)
+            mon_ctrl = QHBoxLayout()
+            mon_ctrl.addWidget(self._lbl("Frequencies (GHz):"))
+            self.monitor_input = QLineEdit(
+                ", ".join(f"{f:.3f}" for f in self.monitor_freqs_ghz)
+            )
+            self.monitor_input.setPlaceholderText("5.650, 5.900, 5.920")
+            self.monitor_input.setStyleSheet(INPUT_STYLE)
+            self.monitor_input.setFixedWidth(300)
+            mon_ctrl.addWidget(self.monitor_input)
+            mon_apply = QPushButton("Apply")
+            mon_apply.setFixedWidth(55)
+            mon_apply.setStyleSheet(BTN_STYLE)
+            mon_apply.clicked.connect(self._apply_monitors)
+            mon_ctrl.addWidget(mon_apply)
+            mon_ctrl.addStretch()
+            mon_outer.addLayout(mon_ctrl)
 
-        self.monitor_scroll = QScrollArea()
-        self.monitor_scroll.setWidgetResizable(True)
-        self.monitor_scroll_widget = QWidget()
-        self.monitor_layout = QVBoxLayout(self.monitor_scroll_widget)
-        self.monitor_scroll.setWidget(self.monitor_scroll_widget)
-        mon_outer.addWidget(self.monitor_scroll)
+            self.monitor_scroll = QScrollArea()
+            self.monitor_scroll.setWidgetResizable(True)
+            self.monitor_scroll_widget = QWidget()
+            self.monitor_layout = QVBoxLayout(self.monitor_scroll_widget)
+            self.monitor_scroll.setWidget(self.monitor_scroll_widget)
+            mon_outer.addWidget(self.monitor_scroll)
 
-        mon_group.setLayout(mon_outer)
-        main_vsplit.addWidget(mon_group)
+            mon_group.setLayout(mon_outer)
+            main_vsplit.addWidget(mon_group)
+        else:
+            # Spectrum Activity Maps replace the monitor panel
+            self._setup_activity_maps(main_vsplit)
 
         main_vsplit.setSizes([450, 350])
         root.addWidget(main_vsplit)
 
-        self._rebuild_monitor_widgets()
+        if SHOW_MONITOR_PANEL:
+            self._rebuild_monitor_widgets()
 
     def _lbl(self, text):
         l = QLabel(text)
         l.setStyleSheet("color:#aaa;")
         return l
+
+    # ----------------------------------------- Spectrum Activity Maps
+    def _engine_map_range_ghz(self):
+        """Return (start_ghz, stop_ghz) of the engine's monitored range."""
+        if HAS_ENGINE:
+            try:
+                cfg = _load_engine_config()
+                return (cfg.frequency_range.start_hz / 1e9,
+                        cfg.frequency_range.stop_hz / 1e9)
+            except Exception:
+                pass
+        return (1.2, 6.0)
+
+    def _update_activity_map_ranges(self):
+        """Zoom the activity-map strips to the current active sweep window."""
+        if not hasattr(self, "_prob_plot") or self._prob_plot is None:
+            return
+        s = self.sweep_start_hz / 1e9
+        e = self.sweep_end_hz / 1e9
+        # X-linked, so setting one updates both strips
+        self._prob_plot.setXRange(s, e, padding=0)
+
+    def _setup_activity_maps(self, parent_splitter):
+        """
+        Build the two frequency-aligned heatmap strips that replace the
+        monitor-frequency panel:
+          - Activity Probability map (per-cell occupancy probability)
+          - Scan Coverage Tracker (cells flare when scanned, then fade)
+        """
+        maps_group = QGroupBox("Spectrum Activity Maps")
+        maps_group.setStyleSheet(
+            "QGroupBox{color:#aaa;border:1px solid #333;margin-top:4px;}"
+            "QGroupBox::title{padding:0 4px;}"
+        )
+        maps_outer = QVBoxLayout()
+        maps_outer.setContentsMargins(4, 4, 4, 4)
+        maps_outer.setSpacing(2)
+
+        # The maps span the engine's full monitored range (1.2-6.0 GHz by
+        # default), independent of the legacy sweep range. The exact rect is
+        # refined from cell centers once the first snapshot arrives.
+        start_ghz, stop_ghz = self._engine_map_range_ghz()
+        span_ghz = stop_ghz - start_ghz
+
+        title_font = QFont("Segoe UI", 11, QFont.Bold)
+        axis_font = QFont("Consolas", 9)
+
+        def _style_map_plot(pw, title_html):
+            pw.setBackground(BG_COLOR)
+            pw.setXRange(start_ghz, stop_ghz, padding=0)
+            pw.setYRange(0, 1)
+            pw.hideAxis("left")
+            pw.setTitle(title_html, size="11pt")
+            pw.setLabel("bottom", "Frequency (GHz)", color="#bbb",
+                        **{"font-size": "10pt"})
+            ax = pw.getAxis("bottom")
+            ax.setPen(pg.mkPen((70, 70, 110)))
+            ax.setTextPen("#ddd")
+            ax.setTickFont(axis_font)
+            pw.setMouseEnabled(x=False, y=False)
+            pw.setMenuEnabled(False)
+
+        # ---- Probability strip ----
+        self._prob_plot = pg.PlotWidget()
+        _style_map_plot(
+            self._prob_plot,
+            "<span style='color:#dddddd'>Activity Probability</span>"
+            "&nbsp;&nbsp;<span style='color:#888888;font-size:9pt'>"
+            "dark = quiet &#8594; red = likely active</span>",
+        )
+        self._prob_img = pg.ImageItem(
+            np.zeros((1, 1), dtype=np.float32), autoLevels=False, levels=(0, 1)
+        )
+        self._prob_img.setLookupTable(_probability_colormap())
+        self._prob_img.setRect(QRectF(start_ghz, 0, span_ghz, 1))
+        self._prob_plot.addItem(self._prob_img)
+        self._add_priority_band_markers(self._prob_plot)
+        maps_outer.addWidget(self._prob_plot)
+
+        # ---- Scan coverage strip ----
+        self._scan_plot = pg.PlotWidget()
+        _style_map_plot(
+            self._scan_plot,
+            "<span style='color:#dddddd'>Scan Coverage Tracker</span>"
+            "&nbsp;&nbsp;<span style='color:#888888;font-size:9pt'>"
+            "bright = just scanned &#8594; dark = not scanned recently</span>",
+        )
+        self._scan_plot.setXLink(self._prob_plot)
+        self._scan_img = pg.ImageItem(
+            np.zeros((1, 1), dtype=np.float32), autoLevels=False, levels=(0, 1)
+        )
+        self._scan_img.setLookupTable(_scan_colormap())
+        self._scan_img.setRect(QRectF(start_ghz, 0, span_ghz, 1))
+        self._scan_plot.addItem(self._scan_img)
+        maps_outer.addWidget(self._scan_plot)
+
+        maps_group.setLayout(maps_outer)
+        parent_splitter.addWidget(maps_group)
+
+    def _add_priority_band_markers(self, plot):
+        """Shade the configured priority bands on a strip for orientation."""
+        bands = [
+            (1.200, 1.350, "1.2G"),
+            (2.300, 2.500, "2.4G"),
+            (5.650, 5.950, "5.8G"),
+        ]
+        for lo, hi, name in bands:
+            region = pg.LinearRegionItem(
+                values=(lo, hi), movable=False,
+                brush=pg.mkBrush(255, 255, 255, 18),
+                pen=pg.mkPen(255, 255, 255, 40),
+            )
+            region.setZValue(10)
+            plot.addItem(region)
 
     def _set_feature(self, key, value):
         self.features[key] = value
@@ -856,6 +1153,20 @@ class DroneDetector(QMainWindow):
             self.freq_axis_ghz, self.cfar_thresh_omni, pen=cfar_pen)
         self.cfar_dir_curve = self.spec_dir.plot(
             self.freq_axis_ghz, self.cfar_thresh_dir, pen=cfar_pen)
+
+        # Engine scan-target indicator lines (show where the engine is currently looking)
+        scan_pen = pg.mkPen("#ff6600", width=1, style=Qt.SolidLine)
+        self._scan_target_line_omni = pg.InfiniteLine(
+            pos=self.sweep_start_hz / 1e9, angle=90, pen=scan_pen,
+            label="↓ scan", labelOpts={"color": "#ff6600", "position": 0.95}
+        )
+        self._scan_target_line_dir = pg.InfiniteLine(
+            pos=self.sweep_start_hz / 1e9, angle=90, pen=scan_pen,
+        )
+        self.spec_omni.addItem(self._scan_target_line_omni)
+        self.spec_dir.addItem(self._scan_target_line_dir)
+        self._scan_target_line_omni.setVisible(False)
+        self._scan_target_line_dir.setVisible(False)
 
         cmap = _sdr_colormap()
         freq_span = (self.sweep_end_hz - self.sweep_start_hz) / 1e9
@@ -1001,13 +1312,25 @@ class DroneDetector(QMainWindow):
                 del self.sdr
                 self.sdr = None
 
-            try:
-                self.sdr = adi.ad9361(uri="ip:192.168.2.1")
-            except Exception:
+            # Prefer the ad9361/IP transport: it exposes both RX channels and is
+            # reliable. The USB Pluto fallback only maps a single channel and, on
+            # this setup, fails to allocate RX buffers (errno 0) and drops off the
+            # bus -> 0 scans. The IP (USB-ethernet) interface can take 10-20 s to
+            # come up after the device enumerates, so retry it before falling back.
+            self.sdr = None
+            for _attempt in range(8):
                 try:
-                    self.sdr = adi.ad9361(uri="ip:pluto.local")
+                    self.sdr = adi.ad9361(uri="ip:192.168.2.1")
+                    break
                 except Exception:
-                    self.sdr = adi.Pluto(uri="usb:")
+                    try:
+                        self.sdr = adi.ad9361(uri="ip:pluto.local")
+                        break
+                    except Exception:
+                        time.sleep(1.5)
+            if self.sdr is None:
+                # Last resort: single-channel USB Pluto (least reliable here).
+                self.sdr = adi.Pluto(uri="usb:")
 
             self.sdr.rx_rf_bandwidth = BANDWIDTH_HZ
             self.sdr.sample_rate = SAMPLE_RATE
@@ -1121,6 +1444,34 @@ class DroneDetector(QMainWindow):
                 spec_dir_welch=self.spectrum_dir_welch,
                 features=self.features, fastlock=self.fastlock,
             )
+
+            # Attach adaptive sensing engine if available
+            if HAS_ENGINE:
+                try:
+                    eng_cfg = _load_engine_config()
+                    self._engine = SpectrumEngine(cfg=eng_cfg, telemetry_enabled=True)
+                    self._engine_backend = SDRBackend(
+                        self.sdr, eng_cfg, dual_channel=self.dual_channel,
+                    )
+                    self._engine.attach_backend(self._engine_backend)
+                    # Honour the currently-selected sweep window
+                    self._engine.set_active_range(self.sweep_start_hz, self.sweep_end_hz)
+                    self.sweep_worker.configure_engine(self._engine, self._engine_backend)
+                    if self.engine_status_label:
+                        n_cells = len(self._engine.cells)
+                        self.engine_status_label.setText(
+                            f"Active — {n_cells} cells over "
+                            f"{eng_cfg.frequency_range.start_hz/1e9:.1f}–"
+                            f"{eng_cfg.frequency_range.stop_hz/1e9:.1f} GHz"
+                        )
+                        self.engine_status_label.setStyleSheet("color:#0f0;padding:1px 4px;")
+                except Exception as eng_ex:
+                    self._engine = None
+                    self._engine_backend = None
+                    if self.engine_status_label:
+                        self.engine_status_label.setText(f"Engine error: {str(eng_ex)[:60]}")
+                        self.engine_status_label.setStyleSheet("color:#f44;padding:1px 4px;")
+
             self.sweep_worker.start()
             self.update_timer.start(80)
 
@@ -1132,6 +1483,16 @@ class DroneDetector(QMainWindow):
     def _disconnect(self):
         self.sweep_worker.stop()
         self.update_timer.stop()
+
+        # Shut down engine telemetry
+        if self._engine is not None:
+            try:
+                self._engine.telemetry.close()
+            except Exception:
+                pass
+            self._engine = None
+            self._engine_backend = None
+
         if self.sdr:
             try:
                 del self.sdr
@@ -1146,6 +1507,13 @@ class DroneDetector(QMainWindow):
         self.status_label.setStyleSheet("color:#888;")
         self.warning_label.setText("")
         self.warning_label.setStyleSheet("color:transparent;")
+        if self.engine_status_label:
+            self.engine_status_label.setText("Idle")
+            self.engine_status_label.setStyleSheet("color:#666;padding:1px 4px;")
+        if self.engine_coverage_label:
+            self.engine_coverage_label.setText("")
+        if self.engine_tracks_label:
+            self.engine_tracks_label.setText("")
         self.alert_panel.clear()
 
     def _reset_buffers(self):
@@ -1207,14 +1575,24 @@ class DroneDetector(QMainWindow):
         self._setup_crosshairs()
         self._reset_buffers()
 
+        # Restrict the adaptive engine to the new window so it only sweeps the
+        # selected band (cells outside become UNSUPPORTED and are skipped).
+        if self._engine is not None:
+            self._engine.set_active_range(self.sweep_start_hz, self.sweep_end_hz)
+            self._scan_heat = None  # re-size/realign the coverage map
+            self._update_activity_map_ranges()
+
         if was_running and self.connected:
-            self.sweep_worker.configure(
-                self.sdr, self.sweep_start_hz, self.num_steps,
-                self.dual_channel, self.spectrum_omni, self.spectrum_dir,
-                spec_omni_welch=self.spectrum_omni_welch,
-                spec_dir_welch=self.spectrum_dir_welch,
-                features=self.features, fastlock=self.fastlock,
-            )
+            if self._engine is not None and self._engine_backend is not None:
+                self.sweep_worker.configure_engine(self._engine, self._engine_backend)
+            else:
+                self.sweep_worker.configure(
+                    self.sdr, self.sweep_start_hz, self.num_steps,
+                    self.dual_channel, self.spectrum_omni, self.spectrum_dir,
+                    spec_omni_welch=self.spectrum_omni_welch,
+                    spec_dir_welch=self.spectrum_dir_welch,
+                    features=self.features, fastlock=self.fastlock,
+                )
             self.sweep_worker.start()
             self.update_timer.start(80)
 
@@ -1419,6 +1797,220 @@ class DroneDetector(QMainWindow):
                     confidence=0.0,
                 )
 
+    def _on_engine_update(self, snapshot):
+        """
+        Handle a SpectrumEngine snapshot delivered from the worker thread.
+
+        Updates:
+          - Waterfall buffer from the engine's rolling display PSD
+          - Engine status bar (scan count, coverage health, tracks)
+          - Alert panel and proximity alerts from confirmed tracks
+        """
+        if snapshot is None:
+            return
+
+        self._engine_scan_count = snapshot.scan_count
+
+        # --- Waterfall: build a downsampled line from the engine's full PSD ---
+        psd = snapshot.last_psd_db
+        freq = snapshot.last_psd_freq_hz
+        if len(psd) > 0 and len(freq) > 0:
+            nf = float(np.percentile(psd, 30))
+            nf = _clamp(nf, -140, -20, -80)
+            self.reference_noise_floor = nf
+
+            x_src = np.linspace(0, len(psd) - 1, len(psd))
+            x_ds = np.linspace(0, len(psd) - 1, WATERFALL_COLS)
+            wf_line = np.interp(x_ds, x_src, psd).astype(np.float32)
+            self.waterfall_omni.append(wf_line)
+            self.waterfall_dir.append(wf_line)
+
+            # Also update the spectrum display buffers used by _update_display
+            # Map engine PSD onto the sweep buffer freq axis
+            if self.total_bins > 0 and len(self.freq_axis_ghz) > 0:
+                freq_ghz = freq / 1e9
+                lo_g = freq_ghz[0]
+                hi_g = freq_ghz[-1]
+                mask = (self.freq_axis_ghz >= lo_g) & (self.freq_axis_ghz <= hi_g)
+                n_dest = int(np.sum(mask))
+                if n_dest > 0:
+                    dest_f = self.freq_axis_ghz[mask] * 1e9
+                    interp = np.interp(dest_f, freq, psd).astype(np.float32)
+                    self.spectrum_omni[mask] = interp
+                    self.spectrum_dir[mask] = interp
+
+        # --- Scan-target indicator line ---
+        if snapshot.last_command is not None and hasattr(self, '_scan_target_line_omni'):
+            scan_ghz = snapshot.last_command.center_hz / 1e9
+            self._scan_target_line_omni.setPos(scan_ghz)
+            self._scan_target_line_dir.setPos(scan_ghz)
+            self._scan_target_line_omni.setVisible(True)
+            self._scan_target_line_dir.setVisible(True)
+
+        # --- Spectrum Activity Maps ---
+        self._update_activity_maps(snapshot)
+
+        # --- Engine status bar ---
+        if self.engine_status_label is not None:
+            age_str = f"max_age={snapshot.max_cell_age_s:.1f}s"
+            overdue_str = f"overdue={snapshot.overdue_cell_count}"
+            self.engine_coverage_label.setText(f"scans={snapshot.scan_count} | {age_str} | {overdue_str}")
+
+        # --- Track-based alerts ---
+        active_tracks = [t for t in snapshot.tracks if t.state not in ("EXPIRED", "LOST")]
+        confirmed = [t for t in active_tracks if t.state in ("CONFIRMED", "TRACKING")]
+
+        if self.engine_tracks_label is not None:
+            if confirmed:
+                track_summary = " | ".join(
+                    f"{t.center_hz/1e9:.3f}GHz({t.state[0]})" for t in confirmed[:4]
+                )
+                self.engine_tracks_label.setText(f"Tracks: {track_summary}")
+                self.engine_tracks_label.setStyleSheet("color:#0ff;padding:1px 4px;font-weight:bold;")
+            elif active_tracks:
+                self.engine_tracks_label.setText(f"Candidates: {len(active_tracks)}")
+                self.engine_tracks_label.setStyleSheet("color:#fa0;padding:1px 4px;")
+            else:
+                self.engine_tracks_label.setText("")
+                self.engine_tracks_label.setStyleSheet("color:#0ff;padding:1px 4px;")
+
+        # --- Push confirmed tracks to the proximity alert panel ---
+        use_dist = self.features.get("use_distance_model", False)
+        track_freqs_pushed = set()
+        for track in confirmed:
+            freq_ghz = track.center_hz / 1e9
+            de = None
+            if use_dist:
+                # Reuse or create a distance estimator keyed to this track
+                key = round(freq_ghz, 3)
+                if key not in self.distance_estimators:
+                    self.distance_estimators[key] = DistanceEstimator()
+                de = self.distance_estimators[key]
+                de.update(track.peak_db)
+            self.alert_panel.push(
+                freq_ghz=freq_ghz,
+                signal_dbfs=track.peak_db,
+                distance_m=de.x if (use_dist and de) else None,
+                confidence=track.confidence,
+            )
+            track_freqs_pushed.add(round(freq_ghz, 3))
+
+        # Push "no signal" for any monitor freq not covered by a track
+        for freq in self.monitor_freqs_ghz:
+            if round(freq, 3) not in track_freqs_pushed:
+                self.alert_panel.push(
+                    freq_ghz=freq,
+                    signal_dbfs=DB_MIN,
+                    distance_m=None,
+                    confidence=0.0,
+                )
+
+        # Update warning banner based on confirmed tracks
+        if confirmed:
+            freqs_str = ", ".join(f"{t.center_hz/1e9:.3f}" for t in confirmed[:3])
+            self.warning_label.setText(f"\u26a0 SIGNAL @ {freqs_str} GHz")
+            self.warning_label.setStyleSheet(
+                "color:white;background:#c00;padding:4px;border-radius:3px;font-weight:bold;"
+            )
+        else:
+            self.warning_label.setText("")
+            self.warning_label.setStyleSheet("color:transparent;")
+
+    def _update_activity_maps(self, snapshot):
+        """
+        Render the activity-probability and scan-coverage strips from a snapshot.
+
+        The probability strip maps each cell's occupancy probability to color.
+        The scan strip uses a decaying heat buffer: a cell flares to 1.0 when
+        scanned and fades by SCAN_HEAT_DECAY each update, so even rarely visited
+        bands visibly blink when they finally get swept.
+        """
+        if not hasattr(self, "_prob_img") or self._prob_img is None:
+            return
+
+        occ = snapshot.occupancy_probs
+        n_cells = len(occ)
+        if n_cells == 0:
+            return
+
+        # Lazily size the heat buffer once we know the cell count
+        if self._scan_heat is None or len(self._scan_heat) != n_cells:
+            self._scan_heat = np.zeros(n_cells, dtype=np.float32)
+            # Align the image rect to the actual cell frequency span
+            centers = snapshot.cell_freq_centers_hz
+            if len(centers) >= 2:
+                width = float(centers[1] - centers[0])
+                start_ghz = (float(centers[0]) - width / 2.0) / 1e9
+                stop_ghz = (float(centers[-1]) + width / 2.0) / 1e9
+                span_ghz = stop_ghz - start_ghz
+                self._prob_img.setRect(QRectF(start_ghz, 0, span_ghz, 1))
+                self._scan_img.setRect(QRectF(start_ghz, 0, span_ghz, 1))
+                # Zoom to the active sweep window (may be narrower than the grid)
+                self._update_activity_map_ranges()
+
+        # --- Probability strip (gamma-lifted for visibility) ---
+        prob = np.clip(occ.astype(np.float32), 0.0, 1.0)
+        prob_disp = np.power(prob, PROB_DISPLAY_GAMMA)
+        self._prob_img.setImage(prob_disp.reshape(n_cells, 1),
+                                autoLevels=False, levels=(0, 1))
+
+        # --- Scan coverage strip: heat derived from per-cell scan age ---
+        # heat = exp(-age / tau): a cell scanned just now is ~1.0 and fades to
+        # 1/e after SCAN_HEAT_TAU_S seconds. This is robust to command type
+        # (coarse, fine, or track revisit) and update rate, since it reads the
+        # engine's actual last_scan_time per cell.
+        age = snapshot.cell_scan_age_s
+        if age is not None and len(age) == n_cells:
+            heat = np.exp(-age.astype(np.float32) / SCAN_HEAT_TAU_S)
+            self._scan_heat = heat
+        else:
+            # Fallback: keep previous behaviour if the field is unavailable
+            heat = self._scan_heat
+
+        heat_disp = np.power(np.clip(heat, 0.0, 1.0), SCAN_DISPLAY_GAMMA)
+        self._scan_img.setImage(heat_disp.reshape(n_cells, 1),
+                                autoLevels=False, levels=(0, 1))
+
+        self._log_map_colors(occ, prob_disp, heat, heat_disp)
+
+    def _log_map_colors(self, prob, prob_disp, heat, heat_disp):
+        """Periodically log render-level values (raw value, gamma-lifted value,
+        and resulting RGB) for the brightest cells, so a 'uniform map' complaint
+        can be debugged at the color level alongside the engine's data log."""
+        import time as _t
+        now = _t.time()
+        if now - getattr(self, "_last_color_log", 0.0) < 3.0:
+            return
+        self._last_color_log = now
+        try:
+            import os
+            prob_lut = _probability_colormap()
+            scan_lut = _scan_colormap()
+
+            def rgb(lut, v):
+                idx = int(np.clip(v, 0, 1) * (len(lut) - 1))
+                r, g, b = lut[idx][:3]
+                return f"({r:3d},{g:3d},{b:3d})"
+
+            order = np.argsort(prob)[::-1][:6]
+            os.makedirs("spectrum_logs", exist_ok=True)
+            with open(os.path.join("spectrum_logs", "map_colors.log"), "a") as fh:
+                fh.write(
+                    f"\n[colors] PROB raw(min/med/max)={prob.min():.3f}/"
+                    f"{np.median(prob):.3f}/{prob.max():.3f}  "
+                    f"HEAT raw(min/med/max)={heat.min():.3f}/"
+                    f"{np.median(heat):.3f}/{heat.max():.3f}\n"
+                )
+                for i in order:
+                    fh.write(
+                        f"  cell#{int(i):3d}: prob={prob[i]:.3f} disp={prob_disp[i]:.3f} "
+                        f"rgb{rgb(prob_lut, prob_disp[i])} | "
+                        f"heat={heat[i]:.3f} disp={heat_disp[i]:.3f} "
+                        f"rgb{rgb(scan_lut, heat_disp[i])}\n"
+                    )
+        except Exception:
+            pass
+
     def _on_sweep_error(self, msg):
         self.status_label.setText(f"Sweep error: {msg}")
         self.status_label.setStyleSheet("color:#f44;")
@@ -1427,7 +2019,13 @@ class DroneDetector(QMainWindow):
     def _update_display(self):
         cur = self.sweep_worker.current_freq
         if cur > 0:
-            self.freq_label.setText("%.3f GHz" % (cur / 1e9))
+            # When engine is running, also show scan count
+            if self._engine is not None:
+                self.freq_label.setText(
+                    "%.3f GHz  [#%d]" % (cur / 1e9, self._engine_scan_count)
+                )
+            else:
+                self.freq_label.setText("%.3f GHz" % (cur / 1e9))
 
         alerts = []
         proximity_alerts = []
@@ -1488,7 +2086,8 @@ class DroneDetector(QMainWindow):
                 img.setRect(QRectF(self.sweep_start_hz / 1e9, 0, span, h))
                 wf_pw.setYRange(0, h)
 
-        self._update_monitor_plots()
+        if SHOW_MONITOR_PANEL:
+            self._update_monitor_plots()
 
     def _update_monitor_plots(self):
         use_dist = self.features.get("use_distance_model", False)
