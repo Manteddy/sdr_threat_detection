@@ -29,7 +29,8 @@ from collections import deque
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QSlider, QGroupBox, QCheckBox,
-    QScrollArea, QFrame, QSplitter, QLineEdit, QDoubleSpinBox, QSpinBox
+    QScrollArea, QFrame, QSplitter, QLineEdit, QDoubleSpinBox, QSpinBox,
+    QComboBox,
 )
 from PyQt5.QtCore import QTimer, Qt, QRectF, QThread, pyqtSignal
 from PyQt5.QtGui import QFont
@@ -48,6 +49,15 @@ try:
 except Exception as _eng_err:
     HAS_ENGINE = False
     _eng_err_msg = str(_eng_err)
+
+# ---- SDR Simulator (no libiio / pyadi-iio dependency) ----
+HAS_SIM = False
+try:
+    from spectrum_engine.sim import SimulatedSDRBackend
+    from spectrum_engine.sim import scenarios as sim_scenarios
+    HAS_SIM = True
+except Exception:
+    pass
 
 # ---- Optional acceleration ----
 HAS_NUMBA = False
@@ -753,6 +763,37 @@ class DroneDetector(QMainWindow):
         self.freq_label.setStyleSheet("color:#0ff;padding:2px;")
         top.addWidget(self.freq_label)
 
+        # ---- Source selector (Hardware vs Simulator) ----
+        top.addWidget(self._lbl("Src:"))
+        self.source_combo = QComboBox()
+        self.source_combo.addItem("Hardware")
+        if HAS_SIM and HAS_ENGINE:
+            self.source_combo.addItem("Simulator")
+        self.source_combo.setFixedWidth(100)
+        self.source_combo.setStyleSheet(INPUT_STYLE)
+        self.source_combo.currentIndexChanged.connect(self._on_source_changed)
+        top.addWidget(self.source_combo)
+
+        # ---- Simulator scene preset (runtime-switchable) ----
+        if HAS_SIM and HAS_ENGINE:
+            top.addWidget(self._lbl(" Scene:"))
+            self.scene_combo = QComboBox()
+            for label, _ in sim_scenarios.GUI_PRESETS:
+                self.scene_combo.addItem(label)
+            default_idx = next(
+                (i for i, (lbl, _) in enumerate(sim_scenarios.GUI_PRESETS)
+                 if "5.8 GHz" in lbl),
+                0,
+            )
+            self.scene_combo.setCurrentIndex(default_idx)
+            self.scene_combo.setFixedWidth(210)
+            self.scene_combo.setStyleSheet(INPUT_STYLE)
+            self.scene_combo.setEnabled(False)  # only meaningful in Simulator mode
+            self.scene_combo.currentIndexChanged.connect(self._on_scene_changed)
+            top.addWidget(self.scene_combo)
+        else:
+            self.scene_combo = None
+
         self.connect_btn = QPushButton("Connect")
         self.connect_btn.setFixedWidth(100)
         self.connect_btn.setStyleSheet(
@@ -1300,6 +1341,14 @@ class DroneDetector(QMainWindow):
 
     # -------------------------------------------------------- Connection
     def try_connect(self):
+        """Dispatch to hardware or simulator path based on the Source combo."""
+        source = self.source_combo.currentText() if hasattr(self, "source_combo") else "Hardware"
+        if source == "Simulator":
+            self._connect_simulator()
+        else:
+            self._connect_hardware()
+
+    def _connect_hardware(self):
         try:
             import adi
         except (ImportError, TypeError, OSError):
@@ -1515,6 +1564,96 @@ class DroneDetector(QMainWindow):
         if self.engine_tracks_label:
             self.engine_tracks_label.setText("")
         self.alert_panel.clear()
+
+    # ------------------------------------------------------------ Simulator
+    def _connect_simulator(self):
+        """Spin up the engine against a SimulatedSDRBackend instead of pyadi-iio."""
+        if not (HAS_SIM and HAS_ENGINE):
+            self.status_label.setText("Simulator unavailable (needs spectrum_engine + sim)")
+            self.status_label.setStyleSheet("color:#f44;")
+            return
+
+        try:
+            eng_cfg = _load_engine_config()
+            scene_label = self.scene_combo.currentText() if self.scene_combo else "Empty band (noise only)"
+            scene = sim_scenarios.preset_by_label(scene_label)
+
+            # No physical SDR — but other code paths inspect self.sdr defensively
+            self.sdr = None
+            self.dual_channel = False
+            self.connected = True
+
+            self.spec_dir.setTitle("RX2 (sim mirror)", color="#ff8800", size="9pt")
+            self.status_label.setText(
+                f"Connected (SIMULATOR: {scene_label}) - "
+                f"{self.sweep_start_hz/1e9:.3f}-{self.sweep_end_hz/1e9:.3f} GHz "
+                f"({self.num_steps} steps)"
+            )
+            self.status_label.setStyleSheet("color:#0ff;")
+            self.connect_btn.setText("Disconnect")
+            self.connect_btn.clicked.disconnect()
+            self.connect_btn.clicked.connect(self._disconnect)
+
+            self._reset_buffers()
+            # Worker still needs configure() so its display buffers / features
+            # are wired up; sdr=None is fine because the simulator path uses
+            # the engine loop, never the classic loop.
+            self.sweep_worker.configure(
+                None, self.sweep_start_hz, self.num_steps,
+                False, self.spectrum_omni, self.spectrum_dir,
+                spec_omni_welch=self.spectrum_omni_welch,
+                spec_dir_welch=self.spectrum_dir_welch,
+                features=self.features, fastlock=self.fastlock,
+            )
+
+            self._engine = SpectrumEngine(cfg=eng_cfg, telemetry_enabled=True)
+            self._engine_backend = SimulatedSDRBackend(
+                eng_cfg, scene,
+                seed=42, dual_channel=False,
+                add_dc_spike=True, realtime=True,
+            )
+            self._engine.attach_backend(self._engine_backend)
+            self._engine.set_active_range(self.sweep_start_hz, self.sweep_end_hz)
+            self.sweep_worker.configure_engine(self._engine, self._engine_backend)
+
+            if self.engine_status_label:
+                self.engine_status_label.setText(
+                    f"Sim: {scene_label} — {len(self._engine.cells)} cells"
+                )
+                self.engine_status_label.setStyleSheet("color:#0ff;padding:1px 4px;")
+
+            self.sweep_worker.start()
+            self.update_timer.start(80)
+
+        except Exception as e:
+            self.connected = False
+            self.status_label.setText(f"Sim connect failed: {str(e)[:60]}")
+            self.status_label.setStyleSheet("color:#f44;")
+
+    def _on_source_changed(self, _idx):
+        """Enable the scene combo only while Simulator is selected."""
+        if self.scene_combo is None:
+            return
+        is_sim = self.source_combo.currentText() == "Simulator"
+        self.scene_combo.setEnabled(is_sim)
+
+    def _on_scene_changed(self, _idx):
+        """Live-swap the simulator's scene while it's running."""
+        if self.scene_combo is None:
+            return
+        backend = self._engine_backend
+        if not isinstance(backend, SimulatedSDRBackend):
+            return  # not in simulator mode or not connected
+        label = self.scene_combo.currentText()
+        try:
+            new_scene = sim_scenarios.preset_by_label(label)
+        except KeyError:
+            return
+        backend.set_scene(new_scene)
+        if self.engine_status_label:
+            self.engine_status_label.setText(
+                f"Sim: {label} — {len(self._engine.cells)} cells"
+            )
 
     def _reset_buffers(self):
         self.spectrum_omni[:] = DB_MIN
