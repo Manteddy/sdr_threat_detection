@@ -144,6 +144,11 @@ class SpectrumEngine:
         # Runtime state
         self._backend: Optional[SDRBackend] = None
         self._processor: SignalProcessor = default_processor()
+        # When False, _process_capture still computes PSD and updates the
+        # display buffer (so the spectrum/waterfall keep refreshing) but
+        # skips cell occupancy / group / fine / track work. The GUI
+        # Detect button flips this.
+        self.detect_enabled: bool = True
         self._scan_count: int = 0
         self._last_snapshot: Optional[EngineSnapshot] = None
         self._last_cmd: Optional[MeasurementCommand] = None
@@ -205,6 +210,38 @@ class SpectrumEngine:
 
     def get_processor(self) -> SignalProcessor:
         return self._processor
+
+    def set_detection_enabled(self, enabled: bool) -> None:
+        """Turn the detection pipeline on/off without stopping the engine.
+
+        When False, capture / PSD / display buffer updates still run, but
+        no cell occupancy updates, no group rebuild, no fine processor
+        call, no track maintenance. The spectrum and waterfall keep
+        moving so the operator can inspect the raw signal.
+        """
+        self.detect_enabled = bool(enabled)
+
+    def reset_detection_state(self) -> None:
+        """Reset all cells to UNKNOWN, drop every track, clear groups.
+
+        Called by the GUI when Detect toggles OFF (per the answer in the
+        feature plan). Leaves baselines and noise floor estimates in
+        place — those are observations about the channel, not detections.
+        """
+        for cell in self.cells:
+            if cell.state == CellState.UNSUPPORTED:
+                continue
+            cell.state = CellState.UNKNOWN
+            cell.occupancy_prob = 0.01
+            # log-odds form must follow the prob field
+            cell.occupancy_logodds = float(np.log(0.01 / 0.99))
+            cell.energy_delta_db = 0.0
+            cell.uncertainty = 1.0
+            cell.coarse_suspicious = False
+            cell.last_strong_bins = 0
+            cell.last_occ_frac = 0.0
+            cell.last_peak_excess_db = 0.0
+        self.track_mgr.clear_all()
 
     def set_active_range(self, start_hz: float, stop_hz: float) -> None:
         """
@@ -319,6 +356,17 @@ class SpectrumEngine:
             mid = psd_primary.size // 2
             med = float(np.median(psd_primary))
             psd_primary[max(0, mid - 1):mid + 2] = med
+
+        # When detection is disabled, skip cell occupancy / group / fine /
+        # track work. PSD and the display buffer still update so the GUI
+        # spectrum + waterfall keep moving — the operator can inspect the
+        # raw signal without algorithmic interpretation.
+        if not self.detect_enabled:
+            self._update_display_buffer(psd_primary, f_ax)
+            self._scan_count += 1
+            snapshot = self._make_snapshot(capture_time, groups)
+            self._last_snapshot = snapshot
+            return snapshot
 
         # --- 5. Update cells touched by this measurement ---
         affected = map_measurement_to_cells(

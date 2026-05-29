@@ -677,8 +677,32 @@ class DroneDetector(QMainWindow):
 
         self.fastlock = FastlockManager()
 
+        # --- Sim preview panel state ---------------------------------
+        # The right-hand column (formerly RX2 directional antenna view)
+        # is repurposed as a continuous ground-truth view of whatever
+        # simulator scene is currently selected. Driven by a separate
+        # timer; the main display update loop does NOT write to it.
+        self._sim_preview_n_bins = 2048
+        self._sim_preview_start_ghz = 1.0
+        self._sim_preview_stop_ghz = 6.5
+        self._sim_preview_freq_ghz = np.linspace(
+            self._sim_preview_start_ghz, self._sim_preview_stop_ghz,
+            self._sim_preview_n_bins, dtype=np.float64,
+        )
+        self._sim_preview_psd_db = np.full(
+            self._sim_preview_n_bins, DB_MIN, dtype=np.float32,
+        )
+        self._sim_preview_wf = deque(maxlen=DEFAULT_WF_LINES)
+        self._sim_preview_rng = np.random.default_rng(42)
+        self._sim_preview_active = False
+        # Detect flag mirrors engine.detect_enabled — default OFF
+        # so the operator can inspect the raw signal first and opt in.
+        self._detect_enabled = False
+        # ------------------------------------------------------------
+
         self._setup_ui()
         self._setup_plots()
+        self._setup_sim_preview_panel()
         self._setup_crosshairs()
         self._setup_alert_window()
 
@@ -688,6 +712,8 @@ class DroneDetector(QMainWindow):
         self.sweep_worker.error_occurred.connect(self._on_sweep_error)
         self.update_timer = QTimer(self)
         self.update_timer.timeout.connect(self._update_display)
+        self._sim_preview_timer = QTimer(self)
+        self._sim_preview_timer.timeout.connect(self._refresh_sim_preview)
 
     # -------------------------------------------------------- Sweep math
     def _recalc_sweep(self):
@@ -816,14 +842,21 @@ class DroneDetector(QMainWindow):
         else:
             self.proc_combo = None
 
-        self.connect_btn = QPushButton("Connect")
-        self.connect_btn.setFixedWidth(100)
-        self.connect_btn.setStyleSheet(
-            "QPushButton{background:#2a2a4a;color:#0f0;border:1px solid #444;padding:4px;}"
-            "QPushButton:hover{background:#3a3a5a;}"
-        )
+        self.connect_btn = QPushButton("Receiver On")
+        self.connect_btn.setFixedWidth(140)
         self.connect_btn.clicked.connect(self.try_connect)
         top.addWidget(self.connect_btn)
+
+        # Detect toggle (default OFF — operator opts in to detection)
+        self.detect_btn = QPushButton("Detect: OFF")
+        self.detect_btn.setFixedWidth(120)
+        self.detect_btn.setCheckable(True)
+        self.detect_btn.setChecked(False)
+        self.detect_btn.toggled.connect(self._on_detect_toggled)
+        top.addWidget(self.detect_btn)
+
+        self._refresh_primary_button_label()
+        self._refresh_detect_button_label()
         root.addLayout(top)
 
         # ---- Controls bar row 1 ----
@@ -1246,6 +1279,98 @@ class DroneDetector(QMainWindow):
             wf_widget.addItem(img)
             setattr(self, attr_img, img)
 
+    def _setup_sim_preview_panel(self):
+        """Take over the RX2 column as the simulator ground-truth preview.
+
+        The widgets keep their old variable names (spec_dir, wf_dir,
+        spec_dir_curve, wf_dir_img) — only the title, X range, data, and
+        overlays change. The main display update loop no longer writes to
+        them; they are driven by `_refresh_sim_preview` exclusively.
+        """
+        self.spec_dir.setTitle(
+            "Simulated Signal (1.0–6.5 GHz)", color="w", size="10pt",
+        )
+        self.spec_dir.setXRange(
+            self._sim_preview_start_ghz, self._sim_preview_stop_ghz, padding=0,
+        )
+        # Re-seed the curve with the sim-preview frequency axis + empty data.
+        self.spec_dir_curve.setData(
+            self._sim_preview_freq_ghz, self._sim_preview_psd_db,
+        )
+        # Detection overlays belonged to the RX2 antenna view; hide them.
+        if hasattr(self, "cfar_dir_curve"):
+            self.cfar_dir_curve.setVisible(False)
+        if hasattr(self, "thresh_line_dir"):
+            self.thresh_line_dir.setVisible(False)
+        if hasattr(self, "_scan_target_line_dir"):
+            self._scan_target_line_dir.setVisible(False)
+        # Waterfall rect: 1.0–6.5 GHz wide, full waterfall depth tall.
+        span = self._sim_preview_stop_ghz - self._sim_preview_start_ghz
+        self.wf_dir_img.setRect(QRectF(
+            self._sim_preview_start_ghz, 0, span, self.wf_max_lines,
+        ))
+
+    def _refresh_sim_preview(self):
+        """Timer slot — render the active simulator scene's analytical PSD.
+
+        Runs while Source == Simulator and the scene_combo is populated.
+        Does nothing in Hardware mode. The detection state of the engine
+        is irrelevant here — this view is ground truth of the air.
+        """
+        if not (self._sim_preview_active and HAS_SIM):
+            return
+        if self.scene_combo is None:
+            return
+        try:
+            scene = sim_scenarios.preset_by_label(self.scene_combo.currentText())
+        except KeyError:
+            return
+        from spectrum_engine.sim import scene_psd_db
+        _, psd = scene_psd_db(
+            scene,
+            self._sim_preview_start_ghz * 1e9,
+            self._sim_preview_stop_ghz * 1e9,
+            self._sim_preview_n_bins,
+            rng=self._sim_preview_rng,
+        )
+        self._sim_preview_psd_db = psd
+        self.spec_dir_curve.setData(self._sim_preview_freq_ghz, psd)
+        # Waterfall — same normalization conventions as the omni waterfall.
+        self._sim_preview_wf.append(psd.copy())
+        if len(self._sim_preview_wf) >= 2:
+            wf = np.array(list(self._sim_preview_wf), dtype=np.float32)
+            nf = _clamp(self.reference_noise_floor, -140, -20, -80)
+            wf_n = np.clip((wf - nf) / DYNAMIC_RANGE, 0, 1)
+            self.wf_dir_img.setImage(wf_n.T, autoLevels=False, levels=(0, 1))
+            span = self._sim_preview_stop_ghz - self._sim_preview_start_ghz
+            self.wf_dir_img.setRect(QRectF(
+                self._sim_preview_start_ghz, 0, span, len(self._sim_preview_wf),
+            ))
+            self.wf_dir.setYRange(0, len(self._sim_preview_wf))
+
+    def _activate_sim_preview(self):
+        """Show + start refreshing the sim preview (called when Src=Simulator)."""
+        self._sim_preview_active = True
+        self._sim_preview_wf.clear()
+        # 5 Hz refresh — light, plenty for static scenes; visible motion when
+        # the scene gets time-varying (drone_approach style scenarios).
+        if not self._sim_preview_timer.isActive():
+            self._sim_preview_timer.start(200)
+        # Run one refresh immediately so the user sees the picked scene
+        # without waiting up to 200 ms.
+        self._refresh_sim_preview()
+
+    def _deactivate_sim_preview(self):
+        """Stop the timer and blank the panel (Hardware mode / startup)."""
+        self._sim_preview_active = False
+        if self._sim_preview_timer.isActive():
+            self._sim_preview_timer.stop()
+        self._sim_preview_psd_db[:] = DB_MIN
+        self.spec_dir_curve.setData(
+            self._sim_preview_freq_ghz, self._sim_preview_psd_db,
+        )
+        self._sim_preview_wf.clear()
+
     def _setup_crosshairs(self):
         self._crosshair_proxies = []
         self._crosshair_items = {}
@@ -1503,9 +1628,9 @@ class DroneDetector(QMainWindow):
                 f"{self.sweep_end_hz/1e9:.3f} GHz ({self.num_steps} steps)"
             )
             self.status_label.setStyleSheet("color:#0f0;")
-            self.connect_btn.setText("Disconnect")
             self.connect_btn.clicked.disconnect()
             self.connect_btn.clicked.connect(self._disconnect)
+            self._refresh_primary_button_label()
 
             self._reset_buffers()
             self.sweep_worker.configure(
@@ -1527,6 +1652,8 @@ class DroneDetector(QMainWindow):
                     self._engine.attach_backend(self._engine_backend)
                     # Apply the GUI's currently-selected signal processor.
                     self._apply_selected_processor()
+                    # Push current Detect button state onto the engine.
+                    self._apply_detection_state()
                     # Honour the currently-selected sweep window
                     self._engine.set_active_range(self.sweep_start_hz, self.sweep_end_hz)
                     self.sweep_worker.configure_engine(self._engine, self._engine_backend)
@@ -1575,9 +1702,9 @@ class DroneDetector(QMainWindow):
                 pass
             self.sdr = None
         self.connected = False
-        self.connect_btn.setText("Connect")
         self.connect_btn.clicked.disconnect()
         self.connect_btn.clicked.connect(self.try_connect)
+        self._refresh_primary_button_label()
         self.status_label.setText("Disconnected")
         self.status_label.setStyleSheet("color:#888;")
         self.warning_label.setText("")
@@ -1616,9 +1743,9 @@ class DroneDetector(QMainWindow):
                 f"({self.num_steps} steps)"
             )
             self.status_label.setStyleSheet("color:#0ff;")
-            self.connect_btn.setText("Disconnect")
             self.connect_btn.clicked.disconnect()
             self.connect_btn.clicked.connect(self._disconnect)
+            self._refresh_primary_button_label()
 
             self._reset_buffers()
             # Worker still needs configure() so its display buffers / features
@@ -1640,6 +1767,7 @@ class DroneDetector(QMainWindow):
             )
             self._engine.attach_backend(self._engine_backend)
             self._apply_selected_processor()
+            self._apply_detection_state()
             self._engine.set_active_range(self.sweep_start_hz, self.sweep_end_hz)
             self.sweep_worker.configure_engine(self._engine, self._engine_backend)
 
@@ -1659,16 +1787,27 @@ class DroneDetector(QMainWindow):
             self.status_label.setStyleSheet("color:#f44;")
 
     def _on_source_changed(self, _idx):
-        """Enable the scene combo only while Simulator is selected."""
+        """Enable scene combo + start/stop the sim preview based on source."""
         if self.scene_combo is None:
             return
         is_sim = self.source_combo.currentText() == "Simulator"
         self.scene_combo.setEnabled(is_sim)
+        if is_sim:
+            self._activate_sim_preview()
+        else:
+            self._deactivate_sim_preview()
+        self._refresh_primary_button_label()
 
     def _on_scene_changed(self, _idx):
-        """Live-swap the simulator's scene while it's running."""
+        """Live-swap the simulator's scene and refresh the preview panel."""
         if self.scene_combo is None:
             return
+        # Always refresh the preview, even when not connected — the user
+        # picks a scene to *see* it before hitting Simulate.
+        if self._sim_preview_active:
+            # Clear waterfall so the new scene's pattern is unmistakable.
+            self._sim_preview_wf.clear()
+            self._refresh_sim_preview()
         backend = self._engine_backend
         if not isinstance(backend, SimulatedSDRBackend):
             return  # not in simulator mode or not connected
@@ -1702,6 +1841,65 @@ class DroneDetector(QMainWindow):
             self._engine.set_processor(get_processor(name))
         except KeyError:
             return  # unknown name → leave the previous processor in place
+
+    # ------------------------------------------------------------ Detect / Connect button helpers
+    def _refresh_primary_button_label(self):
+        """Set Connect-button text + style based on Source + connected state."""
+        if not hasattr(self, "connect_btn"):
+            return
+        src = self.source_combo.currentText() if hasattr(self, "source_combo") else "Hardware"
+        start_style = (
+            "QPushButton{background:#1e4d2b;color:#9fff9f;border:1px solid #2f7a44;"
+            "padding:5px;font-weight:bold;}"
+            "QPushButton:hover{background:#2a6b3b;}"
+        )
+        stop_style = (
+            "QPushButton{background:#4d1e1e;color:#ff9f9f;border:1px solid #7a2f2f;"
+            "padding:5px;font-weight:bold;}"
+            "QPushButton:hover{background:#6b2a2a;}"
+        )
+        if self.connected:
+            label = "Stop simulation" if src == "Simulator" else "Receiver Off"
+            self.connect_btn.setStyleSheet(stop_style)
+        else:
+            label = "Simulate" if src == "Simulator" else "Receiver On"
+            self.connect_btn.setStyleSheet(start_style)
+        self.connect_btn.setText(label)
+
+    def _refresh_detect_button_label(self):
+        """Set Detect toggle text + style based on current state."""
+        if not hasattr(self, "detect_btn"):
+            return
+        if self._detect_enabled:
+            self.detect_btn.setText("Detect: ON")
+            self.detect_btn.setStyleSheet(
+                "QPushButton{background:#5a3b00;color:#ffcc66;border:1px solid #885a00;"
+                "padding:5px;font-weight:bold;}"
+                "QPushButton:hover{background:#7a4f00;}"
+            )
+        else:
+            self.detect_btn.setText("Detect: OFF")
+            self.detect_btn.setStyleSheet(
+                "QPushButton{background:#2a2a4a;color:#888;border:1px solid #444;"
+                "padding:5px;}"
+                "QPushButton:hover{background:#3a3a5a;color:#aaa;}"
+            )
+
+    def _on_detect_toggled(self, checked):
+        """Toggle detection. Going OFF resets all cells + drops tracks."""
+        was_on = self._detect_enabled
+        self._detect_enabled = bool(checked)
+        if self._engine is not None:
+            self._engine.set_detection_enabled(self._detect_enabled)
+            if was_on and not self._detect_enabled:
+                self._engine.reset_detection_state()
+        self._refresh_detect_button_label()
+
+    def _apply_detection_state(self):
+        """Push current detect flag onto the engine (called at connect time)."""
+        if self._engine is None:
+            return
+        self._engine.set_detection_enabled(self._detect_enabled)
 
     def _reset_buffers(self):
         self.spectrum_omni[:] = DB_MIN
@@ -2245,33 +2443,27 @@ class DroneDetector(QMainWindow):
             self.warning_label.setStyleSheet("color:transparent;")
 
         self.spec_omni_curve.setData(self.freq_axis_ghz, self.spectrum_omni)
-        self.spec_dir_curve.setData(self.freq_axis_ghz, self.spectrum_dir)
+        # spec_dir is the Simulated Signal panel — driven by
+        # _refresh_sim_preview, never overwritten here.
 
         if self.features.get("use_cfar_detection"):
             self.cfar_omni_curve.setData(self.freq_axis_ghz, self.cfar_thresh_omni)
-            self.cfar_dir_curve.setData(self.freq_axis_ghz, self.cfar_thresh_dir)
             self.cfar_omni_curve.setVisible(True)
-            self.cfar_dir_curve.setVisible(True)
         else:
             self.cfar_omni_curve.setVisible(False)
-            self.cfar_dir_curve.setVisible(False)
+        # cfar_dir_curve stays hidden — it was an RX2-antenna overlay.
 
         if self.waterfall_omni:
             nf = _clamp(self.reference_noise_floor, -140, -20, -80)
             wf_o = np.array(list(self.waterfall_omni), dtype=np.float32)
-            wf_d = np.array(list(self.waterfall_dir), dtype=np.float32)
             wf_o_n = np.clip((wf_o - nf) / DYNAMIC_RANGE, 0, 1)
-            wf_d_n = np.clip((wf_d - nf) / DYNAMIC_RANGE, 0, 1)
 
             self.wf_omni_img.setImage(wf_o_n.T, autoLevels=False, levels=(0, 1))
-            self.wf_dir_img.setImage(wf_d_n.T, autoLevels=False, levels=(0, 1))
 
             h = len(wf_o)
             span = (self.sweep_end_hz - self.sweep_start_hz) / 1e9
-            for img, wf_pw in [(self.wf_omni_img, self.wf_omni),
-                                (self.wf_dir_img, self.wf_dir)]:
-                img.setRect(QRectF(self.sweep_start_hz / 1e9, 0, span, h))
-                wf_pw.setYRange(0, h)
+            self.wf_omni_img.setRect(QRectF(self.sweep_start_hz / 1e9, 0, span, h))
+            self.wf_omni.setYRange(0, h)
 
         if SHOW_MONITOR_PANEL:
             self._update_monitor_plots()

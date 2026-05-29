@@ -128,6 +128,10 @@ class TrackManager:
         return [t for t in self._tracks.values()
                 if t.state not in (TrackState.EXPIRED,)]
 
+    def clear_all(self) -> None:
+        """Drop every track. Used when the GUI resets detection state."""
+        self._tracks.clear()
+
     def update_from_regions(
         self,
         regions: List["DetectedRegion"],
