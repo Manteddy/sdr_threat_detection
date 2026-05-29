@@ -59,6 +59,14 @@ try:
 except Exception:
     pass
 
+# ---- Pluggable signal-processing algorithms ----
+HAS_PIPELINE = False
+try:
+    from signal_pipeline import list_processors, get_processor
+    HAS_PIPELINE = True
+except Exception:
+    pass
+
 # ---- Optional acceleration ----
 HAS_NUMBA = False
 try:
@@ -794,6 +802,20 @@ class DroneDetector(QMainWindow):
         else:
             self.scene_combo = None
 
+        # ---- Signal-processing algorithm selector (runtime-switchable) ----
+        if HAS_PIPELINE and HAS_ENGINE:
+            top.addWidget(self._lbl(" Proc:"))
+            self.proc_combo = QComboBox()
+            for name, label in list_processors():
+                self.proc_combo.addItem(label, userData=name)
+            self.proc_combo.setCurrentIndex(0)  # default = Classic
+            self.proc_combo.setFixedWidth(180)
+            self.proc_combo.setStyleSheet(INPUT_STYLE)
+            self.proc_combo.currentIndexChanged.connect(self._on_proc_changed)
+            top.addWidget(self.proc_combo)
+        else:
+            self.proc_combo = None
+
         self.connect_btn = QPushButton("Connect")
         self.connect_btn.setFixedWidth(100)
         self.connect_btn.setStyleSheet(
@@ -1503,15 +1525,19 @@ class DroneDetector(QMainWindow):
                         self.sdr, eng_cfg, dual_channel=self.dual_channel,
                     )
                     self._engine.attach_backend(self._engine_backend)
+                    # Apply the GUI's currently-selected signal processor.
+                    self._apply_selected_processor()
                     # Honour the currently-selected sweep window
                     self._engine.set_active_range(self.sweep_start_hz, self.sweep_end_hz)
                     self.sweep_worker.configure_engine(self._engine, self._engine_backend)
                     if self.engine_status_label:
                         n_cells = len(self._engine.cells)
+                        proc_label = self._engine.get_processor().label
                         self.engine_status_label.setText(
                             f"Active — {n_cells} cells over "
                             f"{eng_cfg.frequency_range.start_hz/1e9:.1f}–"
-                            f"{eng_cfg.frequency_range.stop_hz/1e9:.1f} GHz"
+                            f"{eng_cfg.frequency_range.stop_hz/1e9:.1f} GHz "
+                            f"[{proc_label}]"
                         )
                         self.engine_status_label.setStyleSheet("color:#0f0;padding:1px 4px;")
                 except Exception as eng_ex:
@@ -1613,12 +1639,14 @@ class DroneDetector(QMainWindow):
                 add_dc_spike=True, realtime=True,
             )
             self._engine.attach_backend(self._engine_backend)
+            self._apply_selected_processor()
             self._engine.set_active_range(self.sweep_start_hz, self.sweep_end_hz)
             self.sweep_worker.configure_engine(self._engine, self._engine_backend)
 
             if self.engine_status_label:
+                proc_label = self._engine.get_processor().label
                 self.engine_status_label.setText(
-                    f"Sim: {scene_label} — {len(self._engine.cells)} cells"
+                    f"Sim: {scene_label} — {len(self._engine.cells)} cells [{proc_label}]"
                 )
                 self.engine_status_label.setStyleSheet("color:#0ff;padding:1px 4px;")
 
@@ -1654,6 +1682,26 @@ class DroneDetector(QMainWindow):
             self.engine_status_label.setText(
                 f"Sim: {label} — {len(self._engine.cells)} cells"
             )
+
+    def _on_proc_changed(self, _idx):
+        """Live-swap the engine's signal processor (Classic / OS-CFAR / ...)."""
+        if not (HAS_PIPELINE and self.proc_combo is not None):
+            return
+        if self._engine is None:
+            return  # not connected; selection is applied at connect time
+        self._apply_selected_processor()
+
+    def _apply_selected_processor(self):
+        """Push the Proc combo's current selection onto the active engine."""
+        if not (HAS_PIPELINE and self.proc_combo is not None and self._engine is not None):
+            return
+        name = self.proc_combo.currentData()  # short id stored via userData
+        if not name:
+            return
+        try:
+            self._engine.set_processor(get_processor(name))
+        except KeyError:
+            return  # unknown name → leave the previous processor in place
 
     def _reset_buffers(self):
         self.spectrum_omni[:] = DB_MIN

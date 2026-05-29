@@ -49,11 +49,19 @@ def fpv_at(
 def jammer_at(
     center_hz: float,
     *,
-    bandwidth_hz: float = 20e6,
-    power_dbfs: float = -42.0,
+    bandwidth_hz: float = 12e6,
+    power_dbfs: float = -32.0,
     name: str = "",
 ) -> Scene:
-    """Single BARRAGE_JAMMER (band-limited noise) at the given carrier."""
+    """
+    Single BARRAGE_JAMMER (band-limited noise) at the given carrier.
+
+    Default bandwidth (12 MHz) is intentionally narrower than the default
+    capture bandwidth (20 MHz) so the engine sees out-of-jammer bins on
+    each side and percentile-based noise floor estimation still works.
+    A jammer that fills the entire capture is detectable only by
+    cell-aggregate techniques — see `signal_processing_integration_plan`.
+    """
     emitter = Emitter(
         center_hz=center_hz,
         bandwidth_hz=bandwidth_hz,

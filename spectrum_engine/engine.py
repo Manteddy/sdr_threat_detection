@@ -31,6 +31,11 @@ from .detectors import (
     CoarseMeasurement, FineMeasurement,
 )
 from .baseline import update_baseline, update_energy_delta, update_uncertainty
+
+# Pluggable signal processor — defaults to ClassicProcessor which wraps
+# the existing compute_fine_measurement so behaviour is unchanged unless
+# the caller (typically the GUI Proc combo) swaps it out.
+from signal_pipeline import default_processor, SignalProcessor  # noqa: E402
 from .occupancy import (
     update_occupancy_probability, update_cell_state, build_activity_groups,
     ActivityGroup,
@@ -138,6 +143,7 @@ class SpectrumEngine:
 
         # Runtime state
         self._backend: Optional[SDRBackend] = None
+        self._processor: SignalProcessor = default_processor()
         self._scan_count: int = 0
         self._last_snapshot: Optional[EngineSnapshot] = None
         self._last_cmd: Optional[MeasurementCommand] = None
@@ -187,6 +193,18 @@ class SpectrumEngine:
         limits = backend.get_limits()
         self._hw_max_hz = limits.max_hz
         mark_unsupported_cells(self.cells, limits.max_hz)
+
+    def set_processor(self, processor: SignalProcessor) -> None:
+        """Swap the fine-scan signal processor at runtime.
+
+        Safe to call while the engine loop is running — processors are
+        stateless across calls, so a swap just changes which one handles
+        the next fine measurement.
+        """
+        self._processor = processor
+
+    def get_processor(self) -> SignalProcessor:
+        return self._processor
 
     def set_active_range(self, start_hz: float, stop_hz: float) -> None:
         """
@@ -367,9 +385,14 @@ class SpectrumEngine:
 
         # --- 7. Fine detection → region → track update ---
         if cmd.is_fine:
-            fine_meas = compute_fine_measurement(
-                psd_primary, f_ax, capture.timestamp,
-                cmd.center_hz, cmd.bandwidth_hz, cfg,
+            # Dispatch through the pluggable processor. The default
+            # (ClassicProcessor) just calls compute_fine_measurement,
+            # preserving previous behaviour byte-for-byte.
+            fine_meas = self._processor.process_fine(
+                capture=capture,
+                psd_db=psd_primary,
+                freq_axis_hz=f_ax,
+                cfg=cfg,
             )
             self.track_mgr.update_from_regions(fine_meas.detected_regions, capture_time)
 

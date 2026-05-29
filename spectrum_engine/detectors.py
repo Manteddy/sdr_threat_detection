@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import numpy as np
 
@@ -68,6 +68,11 @@ class FineMeasurement:
     occupied_bw_hz: float = 0.0
     confidence: float = 0.0
     noise_floor_db: float = -100.0
+    # Populated by classifying processors (e.g. OSCFARProcessor). Typed
+    # `List[Any]` to avoid a circular import on signal_pipeline; the
+    # consumer (GUI / AlertEngine) treats entries via duck typing on the
+    # ClassificationResult shape defined in signal_pipeline.base.
+    classifications: List[Any] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

@@ -1,175 +1,122 @@
-# Implementation Plan — Sweep + Signal Processing Pipeline Integration
+# Implementation Plan — OS-CFAR + Classifier Processor
 
-> Companion to: [sdr_threat_detection_ProjectDefinition.md §8](sdr_threat_detection_ProjectDefinition.md). Sibling plan: [sdr_simulator_plan.md](sdr_simulator_plan.md).
+> Companion to: [sdr_threat_detection_ProjectDefinition.md §8](sdr_threat_detection_ProjectDefinition.md).
+> Builds on: [signal_processing_selector_plan.md](signal_processing_selector_plan.md) —
+> the pluggable processor architecture, GUI Proc combo, and registry are
+> already in place. This plan only covers the new OSCFARProcessor.
+> Sibling plan: [sdr_simulator_plan.md](sdr_simulator_plan.md).
 
 ## 1. Context
 
-The repo already has a working **sweep + detect** stack:
+The plug-in machinery in [signal_pipeline/](signal_pipeline/__init__.py)
+landed first because we wanted to **preserve the proven CA-CFAR detector
+as a fallback** rather than archive it. [`ClassicProcessor`](signal_pipeline/classic.py)
+wraps `compute_fine_measurement` unchanged and is the default.
 
-- [`SpectrumEngine.step()`](spectrum_engine/engine.py) drives the loop, scheduling coarse / fine measurements via [`Scheduler`](spectrum_engine/scheduler.py) and ingesting IQ through [`SDRBackend.capture()`](spectrum_engine/sdr_backend.py).
-- Coarse and fine PSDs come out of [`spectrum_engine/psd.py`](spectrum_engine/psd.py).
-- Fine measurements run **CA-CFAR** in [`spectrum_engine/detectors.py`](spectrum_engine/detectors.py) → `DetectedRegion`s → [`TrackManager`](spectrum_engine/tracks.py).
-- `SignalTrack.classification` (line 67 of tracks.py) is currently always `"UNKNOWN"`.
+This plan adds **`OSCFARProcessor`** — the new five-stage pipeline the
+user specified (Project Definition §8), shipped as a sibling plug-in. It
+shows up in the GUI Proc combo, runs on every fine scan when selected,
+and produces both `DetectedRegion`s (consumed by the existing
+`TrackManager`) and `ClassificationResult`s (consumed by the GUI label /
+AlertEngine routing in a follow-up).
 
-The new **Signal Processing Pipeline** (project definition §8 + the user-provided spec) adds:
-1. Hamming + averaged PSD pre-processing
-2. **OS-CFAR** (Ordered-Statistic) trigger
-3. Per-ROI feature extraction (bandwidth, Shannon entropy, sync-pulse 15.625 kHz / 50-60 Hz)
-4. Heuristic classifier → `ANALOG_FPV` / `BARRAGE_JAMMER` / `TELEMETRY_LINK` / `UNKNOWN`
-5. Structured `ClassificationResult` dataclass output
+## 2. Where it plugs in
 
-**Goal of this plan:** wire the new pipeline into the existing sweep loop so every fine scan also yields classification telemetry, *without* destabilising the proven CA-CFAR detection path or the < 10 ms per-buffer budget.
+The architecture work is done. New code only touches:
 
----
+| Change | File |
+|--------|------|
+| New | `signal_pipeline/oscfar.py` (`OSCFARProcessor`, helper functions) |
+| Modified | `signal_pipeline/registry.py` (append `OSCFARProcessor` to `_PROCESSORS`) |
+| Modified | `engine_config.yaml` + `spectrum_engine/config.py` (new `signal_pipeline:` section with OS-CFAR knobs) |
 
-## 2. Integration shape (high level)
+The engine, the GUI combo, the runtime-swap mechanism, and
+`FineMeasurement.classifications` already exist.
 
-```
-                                                  ┌──────────────────────────────┐
-                                                  │  new: signal_pipeline/       │
-                                                  │  ───────────────────────────  │
-SpectrumEngine.step()                              │  preprocess() → PSD          │
-   ├─ Scheduler.choose_next_measurement()         │  os_cfar() → ROIs            │
-   ├─ SDRBackend.capture() ──► IQCapture ─────────▶│  extract_features(roi)       │
-   ├─ channel_psd() ──► PSD                       │  classify(features)          │
-   ├─ compute_fine_measurement() (CA-CFAR)        │  → ClassificationResult[]    │
-   │           │                                  └──────────────┬───────────────┘
-   │           ├─ DetectedRegion[]                                │
-   │           │                                                  │
-   │           └─ TrackManager.update_from_regions(...)           │
-   │                                ▲                             │
-   │                                └── merge classifications by  │
-   │                                    frequency overlap ────────┘
-   │
-   └─► EngineSnapshot (adds: classifications: List[ClassificationResult])
-                │
-                ▼
-       Qt UI + AlertEngine
-```
+## 3. The five stages
 
-Two boundary properties to preserve:
+### 3.1 Stage 1 — Preprocessing
 
-- **Trigger remains CA-CFAR.** The engine's existing CA-CFAR continues to drive cell occupancy and track creation. OS-CFAR runs in parallel as a *second opinion* feeding the classifier — it is not promoted to primary trigger in v1.
-- **Pipeline is pure.** The new package has no thread/IO/Qt deps; it accepts IQ and config in, returns dataclasses out. The Qt worker thread still owns scheduling; the engine still owns state.
+The engine already hands the processor a Welch-averaged PSD via
+`channel_psd(..., fine=True)`. That **is** the integrated PSD the spec
+calls for; we use it directly. Hamming-vs-Blackman window choice is a
+config knob (`signal_pipeline.window`) defaulting to `blackman` for
+consistency with the rest of the engine, switchable to `hamming` per spec.
 
----
+Sync-pulse detection in Stage 3 needs the raw time-domain IQ too, so
+`process_fine` reads `capture.omni_iq.ravel()` once and keeps it.
 
-## 3. Module layout (new package)
+### 3.2 Stage 2 — OS-CFAR sliding window
 
-```
-signal_pipeline/
-    __init__.py              # exports SignalPipeline, ClassificationResult, Classification
-    pipeline.py              # SignalPipeline.run(iq, fs, center_hz) — orchestrates stages 1-5
-    preprocess.py            # split-window-FFT-average → PSD (stage 1)
-    os_cfar.py               # OS-CFAR sliding window → ROIs (stage 2)
-    features.py              # bandwidth, spectral entropy, sync-pulse detection (stage 3)
-    classifier.py            # heuristic decision matrix → label + confidence (stage 4)
-    results.py               # @dataclass ClassificationResult, ROIFeatures, Classification enum (stage 5)
-```
+Per spec:
+- Guard cells: 4 (2 / side)
+- Reference cells: 16 (8 / side)
+- Threshold = `P_k + α_db`, where `P_k` is the **k-th percentile** of the
+  sorted reference window (default 75th).
+- Above-threshold bins clustered into contiguous ROIs.
+- Minimum ROI width = `min_roi_bw_hz` (default 100 kHz); pairs separated
+  by < `merge_gap_hz` (default 1 MHz) merged.
 
-Public API (single entry-point):
+Implementation: vectorise with `numpy.lib.stride_tricks.sliding_window_view`
++ `np.partition` so the percentile is computed across all CUTs in one
+NumPy call. Edge bins use a shorter window (asymmetric) rather than
+wrap-around — same convention as the existing `cfar_threshold_1d`.
 
-```python
-from signal_pipeline import SignalPipeline, ClassificationResult
+Early-exit: if no ROIs, skip stages 3-5 and return a `FineMeasurement`
+with the (empty) Welch threshold and empty classification list — no
+wasted feature work.
 
-pipeline = SignalPipeline(cfg=engine_cfg.signal_pipeline)
-results: list[ClassificationResult] = pipeline.run(
-    iq=capture.omni_iq.ravel(),           # complex64 1-D
-    fs=cfg.hardware.sample_rate_hz,
-    center_hz=capture.center_hz,
-)
-```
-
-`ClassificationResult` carries: `frequency_hz`, `bandwidth_hz`, `signal_strength_db`, `classification` (enum), `confidence_score` (0..1), plus an internal `roi_bins` tuple and `features` dict for debugging.
-
-### Reuse, do not rewrite
-
-- **PSD pre-processing** mirrors the math already in [`psd.coarse_psd_db`](spectrum_engine/psd.py:55) but with **Hamming** (per spec) and explicit M segments × N samples shaping. Factor the windowed-FFT-average loop into a small helper if the call signatures differ enough that a shared function is awkward.
-- **ROI extraction** can reuse the contiguous-run-finding pattern from [`cfar_detect_regions`](spectrum_engine/detectors.py:177) — copy the structure, swap CA threshold for OS threshold.
-- **DC-spike excision** — apply the same median-replacement trick the engine already uses ([engine.py:300-303](spectrum_engine/engine.py:300)) so PlutoSDR's LO leakage does not become a false ROI.
-
----
-
-## 4. Stage-by-stage implementation
-
-### 4.1 Stage 1 — `preprocess.py`
-
-```python
-def integrated_psd(iq: np.ndarray, n: int = 1024, m: int | None = None,
-                   window: str = "hamming") -> np.ndarray
-```
-- Truncate/reshape `iq` into `(M, N)`. If `m is None`, use `len(iq) // n`.
-- Apply Hamming window to each row (cache the window like `psd._get_window`).
-- FFT each row, `fftshift`, magnitude-squared.
-- Mean across the M axis → 1-D PSD (linear power).
-- Convert to dB: `10*log10(psd + eps)`.
-
-### 4.2 Stage 2 — `os_cfar.py`
-
-```python
-def os_cfar(psd_db: np.ndarray, *, guard: int = 4, reference: int = 16,
-            k_percentile: float = 75.0, alpha_db: float = 6.0) -> list[tuple[int, int]]
-```
-- For each CUT, gather the `reference` cells split evenly around the CUT, skipping the `guard` window.
-- Sort and pick the **k-percentile** value (default 75th — spec). Vectorise with `np.partition` over a sliding view (`numpy.lib.stride_tricks.sliding_window_view`) to keep this under the budget.
-- Threshold = `P_k + alpha_db`. Flag bins above threshold.
-- Cluster contiguous flagged bins into `(start_bin, stop_bin)` tuples.
-- Drop ROIs narrower than `min_roi_bins` (config). Merge ROIs with gap < `merge_gap_bins`.
-- **Early-exit short-circuit:** if no ROIs, the caller skips stages 3-5. Keep the empty list as the cheap path.
-
-### 4.3 Stage 3 — `features.py`
+### 3.3 Stage 3 — Per-ROI features
 
 For each ROI:
-- **Bandwidth**: `(stop_bin - start_bin + 1) * fs / n`.
-- **Spectral entropy**: convert in-ROI PSD bins to linear power, normalise so they sum to 1, return `-sum(p * log2(p + eps))`.
-- **Sync-pulse detection**: take the time-domain magnitude of the IQ within the ROI's frequency band (band-pass via `np.fft.ifft` of zeroed-out-of-band PSD bins, or downconvert+lowpass), compute envelope-power FFT (low resolution, e.g. 4096 pts), and probe for peaks at:
-  - `15.625 kHz ± 200 Hz` (analog horizontal sync)
-  - `50 Hz / 60 Hz ± 2 Hz` (frame refresh)
-- Returns `ROIFeatures(bandwidth_hz, entropy_bits, sync_15625_db, sync_50_db, sync_60_db, peak_db, noise_floor_db)`.
 
-### 4.4 Stage 4 — `classifier.py`
+- **Bandwidth** = `(stop_bin - start_bin + 1) * fs / fft_size`.
+- **Shannon spectral entropy** = `-Σ p_i log₂ p_i` where `p_i` is the
+  in-ROI PSD bin normalised to sum to 1 (converted to linear power first).
+- **Sync-pulse detection**:
+  1. Take a copy of the original PSD spectrum, zero out everything
+     outside the ROI, IFFT → time-domain band-limited signal `x_roi(t)`.
+  2. Compute envelope power `|x_roi(t)|²`.
+  3. Low-resolution FFT of the envelope (4096 bins).
+  4. Probe for peaks at **15.625 kHz ± 200 Hz** (horizontal sync),
+     **50 Hz ± 2 Hz** and **60 Hz ± 2 Hz** (frame refresh).
+  5. Each detection reports a SNR-like "peak above local noise" in dB.
 
-Hardcoded decision matrix from the spec:
+The fine-scan buffer at default config (`num_frames=16`, `fft_size=4096`
+→ 65 536 samples / 1.6 ms at 40 MS/s) covers ~25 horizontal sync periods,
+so the 15.625 kHz line is resolvable. The 50/60 Hz vertical line requires
+≥ one full frame — at 1.6 ms we get ~0.1 frames, so vertical sync needs a
+longer fine scan to register. Document the limitation; classifier falls
+back to horizontal-sync-only confidence.
+
+### 3.4 Stage 4 — Heuristic classifier
+
+Hardcoded decision matrix:
 
 | Class | Conditions |
 |-------|------------|
-| `ANALOG_FPV` | `6e6 ≤ bw ≤ 10e6` AND entropy mid-range (e.g. `3 < H < 6`) AND `sync_15625_db > sync_threshold_db` |
-| `BARRAGE_JAMMER` | `bw > 12e6` AND entropy near-max (`H > 6.5`) AND no sync detected |
-| `TELEMETRY_LINK` | `bw < 1e6` |
+| `ANALOG_FPV` | `fpv_bw_min ≤ bw ≤ fpv_bw_max` AND `entropy_fpv_min < H < entropy_fpv_max` AND `sync_15625_db > sync_threshold_db` |
+| `BARRAGE_JAMMER` | `bw > jammer_bw_min` AND `H > entropy_jammer_min` AND no sync detected |
+| `TELEMETRY_LINK` | `bw < telemetry_bw_max` |
 | `UNKNOWN` | otherwise |
 
-Confidence is built from the count of matched conditions divided by the count tested (cap at 1.0). All thresholds live in `signal_pipeline.config.SignalPipelineCfg` so they can be tuned without code changes.
+Confidence = matched-conditions / tested-conditions, capped at 1.0. All
+thresholds come from the `signal_pipeline:` config block.
 
-### 4.5 Stage 5 — `results.py`
+### 3.5 Stage 5 — Output
 
-```python
-@dataclass(frozen=True)
-class ClassificationResult:
-    frequency_hz: float       # ROI centre
-    bandwidth_hz: float
-    signal_strength_db: float # peak in ROI (dBFS)
-    classification: Classification  # enum
-    confidence_score: float
-    roi_bins: tuple[int, int]
-    features: dict            # ROIFeatures as dict for telemetry
-```
+Each ROI's classification is a `ClassificationResult` (already defined in
+[signal_pipeline/base.py](signal_pipeline/base.py)). The processor
+populates `FineMeasurement.classifications` (already a field after the
+selector work) with one entry per ROI.
 
-`Classification` is an `Enum` (`ANALOG_FPV`, `BARRAGE_JAMMER`, `TELEMETRY_LINK`, `UNKNOWN`).
+## 4. Config
 
----
-
-## 5. Wiring into the existing engine
-
-### 5.1 Config additions
-
-Extend [`engine_config.yaml`](engine_config.yaml) with a `signal_pipeline:` section and add a matching dataclass in [`spectrum_engine/config.py`](spectrum_engine/config.py):
+Append to [engine_config.yaml](engine_config.yaml):
 
 ```yaml
 signal_pipeline:
-  enabled: true
-  fft_size: 1024
-  segments: 8
-  window: hamming
+  window: blackman
   os_cfar:
     guard_cells: 4
     reference_cells: 16
@@ -186,101 +133,79 @@ signal_pipeline:
     sync_threshold_db: 8.0
 ```
 
-The fallback defaults in `config.py` should match these values so the engine still boots without YAML.
+Add a matching `SignalPipelineCfg` dataclass in
+[spectrum_engine/config.py](spectrum_engine/config.py) with the same
+default values, so the engine still boots without YAML / PyYAML and a
+processor can read the cfg via the existing `EngineConfig.signal_pipeline`
+attribute.
 
-### 5.2 Hook in `SpectrumEngine._process_capture`
+## 5. Performance budget
 
-In [`engine.py`](spectrum_engine/engine.py) `_process_capture`, right after `compute_fine_measurement(...)` and before `track_mgr.update_from_regions(...)`:
+Spec target: **< 10 ms per dwell buffer** for the fine path (the new code
+budget — the engine's own PSD + cell-update work is separate).
 
-```python
-if cmd.is_fine and self._signal_pipeline is not None:
-    iq_flat = capture.omni_iq.ravel()
-    classifications = self._signal_pipeline.run(
-        iq=iq_flat,
-        fs=cfg.hardware.sample_rate_hz,
-        center_hz=cmd.center_hz,
-    )
-    self._attach_classifications_to_regions(fine_meas.detected_regions, classifications)
-```
+- Stage 2 (OS-CFAR) is the hot loop. Vectorised partition should keep it
+  ~1-2 ms at `fft_size = 4096`.
+- Stage 3 envelope FFT and sync probe: ~1 ms per ROI; capped by the
+  early-exit when no ROIs.
+- Stages 4-5: trivial.
 
-`_attach_classifications_to_regions` matches by frequency overlap (use the same overlap test as `map_measurement_to_cells`) and copies `classification` + `confidence_score` into the matching `DetectedRegion`. When the track manager promotes a region to a `SignalTrack`, copy the classification onto `SignalTrack.classification` (already exists at [tracks.py:67](spectrum_engine/tracks.py:67)).
+Add a `time.perf_counter()` instrument around `process_fine` and emit
+mean / p95 to telemetry. If p95 exceeds the budget, drop in a Numba
+kernel for OS-CFAR — same shape as the existing
+`_cfar_threshold_numba` accelerator in `drone_detector_enhanced.py`.
 
-### 5.3 Pipeline lifecycle
+## 6. Implementation order
 
-Construct lazily in `SpectrumEngine.__init__`:
+1. **Scaffold** `signal_pipeline/oscfar.py` with class skeleton and
+   helper signatures, no behaviour.
+2. **Stage 2 (OS-CFAR)** with a noise-only PSD test — assert zero ROIs.
+3. **Stage 3 features** against synthetic FPV IQ produced by the
+   simulator (`scenarios.fpv_at(5.8e9)`) — assert 15.625 kHz peak is
+   detected, entropy in the moderate range.
+4. **Stage 4 classifier** — assert FPV scene → `ANALOG_FPV`, jammer
+   scene → `BARRAGE_JAMMER`.
+5. **Config plumbing** — new dataclass, YAML extension, defaults.
+6. **Register** in `signal_pipeline/registry.py` so the GUI Proc combo
+   shows it.
+7. **Telemetry** — append per-scan classifications to
+   `spectrum_logs/classifications.log`.
+8. **Performance pass** — measure, optionally JIT Stage 2.
 
-```python
-from signal_pipeline import SignalPipeline
-self._signal_pipeline: Optional[SignalPipeline] = (
-    SignalPipeline(self.cfg.signal_pipeline) if self.cfg.signal_pipeline.enabled else None
-)
-```
+Each step a separate commit.
 
-A future "disable at runtime" toggle can flip `_signal_pipeline = None` from the GUI — same pattern the existing `FEATURES` flags use.
+## 7. Verification
 
-### 5.4 Snapshot surface
+- **Headless test, FPV scene** (`scenarios.fpv_at(5.8e9, power_dbfs=-30)`):
+  switch engine processor to `OSCFARProcessor`, run ≥ 200 fine scans,
+  assert at least one `ClassificationResult` with `classification ==
+  "ANALOG_FPV"` and `confidence_score > 0.5`.
+- **Jammer scene** (`scenarios.jammer_at(2.45e9)`): switch processor,
+  assert `BARRAGE_JAMMER` classification — this is the jammer-blind-spot
+  that motivated the new processor in the first place; passing this is
+  the headline win.
+- **Default-path regression**: leave engine processor as Classic, repeat
+  the standard FPV @ 5.8 GHz cell-occupancy assertion. Must be unchanged.
+- **GUI**: run the enhanced detector against the simulator, flip the
+  Proc combo Classic ↔ OS-CFAR mid-run — no crash, status label updates.
+- **Performance**: p95 of `OSCFARProcessor.process_fine` < 8 ms over
+  1000 iterations at default fine-scan config.
 
-Add to [`EngineSnapshot`](spectrum_engine/engine.py:61):
+## 8. Out of scope (deferred)
 
-```python
-classifications: List[ClassificationResult] = field(default_factory=list)
-```
-
-Populate in `_make_snapshot` from `self._last_classifications` (set in `_process_capture`). Importantly: copy the list; do not share references with the worker thread state.
-
-### 5.5 GUI + alert surface
-
-[`drone_detector_enhanced.py`](drone_detector_enhanced.py) already routes `EngineSnapshot` to a slot. Extend that slot (around line 1802) to:
-- Render classification labels next to detected tracks (small overlay or table column).
-- Pass classification + confidence into [`AlertEngine.update(...)`](proximity_alert/engine.py:152) as additional fields (requires adding a `classification` parameter that defaults to `None` to keep the alert engine usable standalone).
-- For `BARRAGE_JAMMER`: suppress the proximity alert promotion to CRITICAL (jamming is not approaching, it's just loud). Add a guard in `AlertEngine._classify_threat`.
-
-### 5.6 Telemetry
-
-Extend [`TelemetryLogger`](spectrum_engine/telemetry.py) with `log_classifications(classifications, ts)` so each fine scan's classification list lands in `spectrum_logs/classifications.log`. JSON-lines format, one row per classification.
-
----
-
-## 6. Performance budget
-
-Spec target: **< 10 ms per dwell buffer**. With default config (`fine_scan.num_frames=16`, `fine_scan.fft_size=4096`) this is the most expensive scan path.
-
-- Stage 1 (PSD): ~1-2 ms (8 × 1024-point FFTs).
-- Stage 2 (OS-CFAR): the hot loop. Avoid Python per-bin loops; use `sliding_window_view` + `np.partition` along the last axis. Aim for ~2-3 ms.
-- Stages 3-5: only run if ROIs found; ~1 ms total in the common case (0-2 ROIs).
-- Slack for engine overhead: ~3-4 ms.
-
-Add a `time.perf_counter()` wrapper around `pipeline.run` and log mean / p95 to telemetry. If p95 exceeds 8 ms, the implementation lands a Numba kernel for OS-CFAR (parallel to the existing optional Numba accelerator in [drone_detector_enhanced.py:_cfar_threshold_numba](drone_detector_enhanced.py)).
-
----
-
-## 7. Implementation order
-
-1. **Scaffold `signal_pipeline/`** with all five module files, dataclasses, and empty function signatures. No behaviour yet — just import-clean.
-2. **Stage 1 + Stage 2** end-to-end on a vector of pure noise — assert zero ROIs, confirm early-exit path.
-3. **Stage 3 + Stage 4** against synthetic IQ from the simulator (see [sdr_simulator_plan.md](sdr_simulator_plan.md)): FPV scene → `ANALOG_FPV`, jammer → `BARRAGE_JAMMER`, telemetry → `TELEMETRY_LINK`.
-4. **Config + engine wiring**: add `signal_pipeline:` to `engine_config.yaml`, the dataclass in `config.py`, lazy construct in `SpectrumEngine.__init__`.
-5. **Hook in `_process_capture`** — gated by `self._signal_pipeline is not None`, executes only when `cmd.is_fine`.
-6. **Snapshot field + GUI surface** — render labels, route to `AlertEngine`.
-7. **Telemetry** — JSON-lines log of every classification with timestamp + scan_count.
-8. **Performance pass** — measure, optionally JIT OS-CFAR with Numba.
-
-Each step lands as its own commit / PR so review is reasonable.
-
----
-
-## 8. Verification
-
-- **Unit tests** (new `tests/` folder): per-stage tests that build synthetic PSDs / IQ and assert the expected ROI / feature / class. Use the simulator (sibling plan) as the IQ source — never call out to real hardware in tests.
-- **Integration test**: spin up `SpectrumEngine` with the simulated `SDRBackend` (see sibling plan §4) and assert that running N fine scans against a known FPV scene yields ≥ M classifications matching `ANALOG_FPV` with confidence > 0.6.
-- **Performance benchmark**: 1000-iteration loop, print mean / p50 / p95 / p99 for `pipeline.run`. Gate the integration on p95 < 8 ms.
-- **Manual smoke**: run `drone_detector_enhanced.py` against the simulator, confirm classification labels appear in the GUI and alert engine flags FPV scenes as `DETECTED` and jammer scenes as low-severity.
-
----
-
-## 9. Out of scope (deferred)
-
-- Adaptive (non-heuristic) classifier — a small CNN over the in-ROI spectrogram is a natural Phase 2 but adds heavy dependencies; the heuristic spec is the deliverable.
-- Replacing CA-CFAR with OS-CFAR as the engine's primary trigger. We may revisit once OS-CFAR has been validated in parallel for several weeks of telemetry.
-- Direction finding from the dir-antenna channel — `pipeline.run` currently only consumes omni. The dir channel is available on `IQCapture.dir_iq` if/when DOA is added.
-- Multi-emitter co-channel separation. The classifier assumes one emitter per ROI.
+- **Routing classifications into `AlertEngine`** — needs a new field on
+  `ProximityAlert` and threat-rule changes (e.g. don't escalate
+  `BARRAGE_JAMMER` to `CRITICAL`). Lands as a separate plan after the
+  processor itself is proven against live signals.
+- **Snapshot surfacing** — `EngineSnapshot.classifications` field plus a
+  small GUI overlay. Out of scope until the AlertEngine routing decision
+  is made; until then, `_dump_detection_log` in
+  [`SpectrumEngine`](spectrum_engine/engine.py) can be extended to log
+  classifications for debugging.
+- **OS-CFAR as primary trigger replacing CA-CFAR** — explicitly *not*
+  done. Both run side-by-side; the operator picks via the Proc combo.
+  Promotion is a separate decision once telemetry shows OS-CFAR is at
+  least as good across the regression scenarios.
+- **Multi-emitter co-channel separation** — the classifier assumes one
+  emitter per ROI. Multi-emitter rejection / splitting is a Phase 2
+  refinement.
