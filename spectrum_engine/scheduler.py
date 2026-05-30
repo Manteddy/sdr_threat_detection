@@ -361,17 +361,55 @@ class Scheduler:
             best_group = max(active_groups, key=lambda g: g.group_probability)
             return self._make_group_fine_cmd(best_group, cfg)
 
-        # 3. Frequent coarse revisit of the most interesting cell
-        interesting = [
-            c for c in cells
-            if c.state in (CellState.ACTIVE, CellState.SUSPECT, CellState.TRACKED)
-            or c.priority_weight > 1.0
-        ]
+        # 3. Tier-based round-robin among "interesting" cells.
+        #
+        # Previously this picked max(scan_score), which locks the priority slot
+        # to whichever active cell has the highest score (e.g. 1.8 GHz) and
+        # starves other equally suspicious cells (2.0/2.2 GHz). Instead we use
+        # tiers + staleness:
+        #
+        #   Tier 3 (signal-confirmed):  TRACKED / ACTIVE
+        #   Tier 2 (suspected):         SUSPECT
+        #   Tier 1 (priority-band):     no signal yet, but configured as a
+        #                               drone-relevant band (e.g. 2.4G, 5.8G)
+        #
+        # We always serve the highest non-empty tier and round-robin within
+        # it by absolute staleness (now - last_scan_time). A just-revisited
+        # cell resets to staleness=0 and goes to the back of the queue, so
+        # if two active cells exist they alternate naturally; if five active
+        # cells exist they cycle through all five before any repeat. This is
+        # exactly what the user asked for: "frequently revisit ALL frequencies
+        # that are suspicious enough".
+        #
+        # Coverage (3 of 4 cycles) still guarantees every cell gets re-swept,
+        # including non-signal priority-band cells, so configured drone bands
+        # are never silently forgotten.
+        def _tier(c) -> int:
+            if c.state in (CellState.TRACKED, CellState.ACTIVE):
+                return 3
+            if c.state == CellState.SUSPECT:
+                return 2
+            if c.priority_weight > 1.0:
+                return 1
+            return 0
+
+        interesting = [c for c in cells if _tier(c) > 0]
         if interesting:
-            best = max(interesting, key=lambda c: c.scan_score)
+            top_tier = max(_tier(c) for c in interesting)
+            tier_cells = [c for c in interesting if _tier(c) == top_tier]
+
+            def _stale_of(c):
+                return (now - c.last_scan_time) if c.last_scan_time > 0 else now
+
+            # Pick the cell in the top tier that has waited the longest.
+            best = max(tier_cells, key=lambda c: (_stale_of(c), c.scan_score))
+            stale = _stale_of(best)
             tt = (TargetType.PRIORITY_CELL_COARSE_SCAN
                   if best.priority_weight > 1.0 else TargetType.BACKGROUND_CELL_COARSE_SCAN)
-            return self._make_coarse_cmd(best, cfg, tt, reason=f"priority score={best.scan_score:.2f}")
+            return self._make_coarse_cmd(
+                best, cfg, tt,
+                reason=f"priority t{top_tier} stale={stale:.2f}s score={best.scan_score:.2f}",
+            )
 
         return None
 

@@ -171,6 +171,9 @@ SCAN_DISPLAY_GAMMA = 0.5
 # that is starting to show activity is clearly visible instead of dark blue.
 PROB_DISPLAY_GAMMA = 0.5
 
+# Show live numeric diagnostics on map panels.
+MAP_DEBUG_OVERLAY = True
+
 
 # ---------------------------------------------------------------- Utilities
 def _welch_psd_db(iq, fft_size=FFT_SIZE, overlap_frac=WELCH_OVERLAP_FRAC):
@@ -228,6 +231,26 @@ def _scan_colormap():
         (255, 150, 0), (255, 220, 120), (255, 255, 255),
     ]
     return pg.ColorMap(np.linspace(0, 1, len(colors)), colors).getLookupTable(0, 1, 256)
+
+
+# Number of rows in the activity-map strip images. A strip is a 1-D row of
+# per-cell values; we tile it into a few rows so the live ViewBox always treats
+# it as a normal 2D image (a 1-pixel-tall image can be dropped/mis-scaled,
+# which made the strips look uniform).
+N_MAP_ROWS = 8
+
+
+def _strip_image(values, axis_order):
+    """Turn a 1-D per-cell array into a 2D strip image with cells along the
+    frequency (X) axis, oriented for the active pyqtgraph image axis order."""
+    n = len(values)
+    row = np.asarray(values, dtype=np.float32).reshape(1, n)
+    # rows stacked in the orthogonal axis
+    if axis_order == "row-major":
+        # row-major: image indexed [y, x] -> shape (rows, n)
+        return np.repeat(row, N_MAP_ROWS, axis=0)
+    # col-major: image indexed [x, y] -> shape (n, rows)
+    return np.repeat(row.T, N_MAP_ROWS, axis=1)
 
 
 # ----------------------------------------------------------- CFAR Detection
@@ -1172,6 +1195,12 @@ class DroneDetector(QMainWindow):
         self._prob_img.setLookupTable(_probability_colormap())
         self._prob_img.setRect(QRectF(start_ghz, 0, span_ghz, 1))
         self._prob_plot.addItem(self._prob_img)
+        self._prob_dbg_text = pg.TextItem(anchor=(0, 1), color=(230, 230, 230))
+        self._prob_dbg_text.setZValue(200)
+        self._prob_dbg_text.setFont(QFont("Consolas", 8))
+        self._prob_dbg_text.setPos(start_ghz + 0.01 * span_ghz, 0.98)
+        self._prob_dbg_text.setVisible(MAP_DEBUG_OVERLAY)
+        self._prob_plot.addItem(self._prob_dbg_text)
         self._add_priority_band_markers(self._prob_plot)
         maps_outer.addWidget(self._prob_plot)
 
@@ -1190,6 +1219,12 @@ class DroneDetector(QMainWindow):
         self._scan_img.setLookupTable(_scan_colormap())
         self._scan_img.setRect(QRectF(start_ghz, 0, span_ghz, 1))
         self._scan_plot.addItem(self._scan_img)
+        self._scan_dbg_text = pg.TextItem(anchor=(0, 1), color=(230, 230, 230))
+        self._scan_dbg_text.setZValue(200)
+        self._scan_dbg_text.setFont(QFont("Consolas", 8))
+        self._scan_dbg_text.setPos(start_ghz + 0.01 * span_ghz, 0.98)
+        self._scan_dbg_text.setVisible(MAP_DEBUG_OVERLAY)
+        self._scan_plot.addItem(self._scan_dbg_text)
         maps_outer.addWidget(self._scan_plot)
 
         maps_group.setLayout(maps_outer)
@@ -2365,26 +2400,39 @@ class DroneDetector(QMainWindow):
         if n_cells == 0:
             return
 
-        # Lazily size the heat buffer once we know the cell count
+        # Lazily size the heat buffer and compute strip rect once we know the
+        # cell count. NOTE: the actual setRect() must happen AFTER setImage()
+        # below, because pyqtgraph rebuilds its transform from the current
+        # image's pixel dimensions inside setRect. Calling setRect while the
+        # ImageItem still holds the (1, 1) placeholder produces a transform
+        # that scales the later (n_cells, 8) image to ~n_cells*span GHz wide,
+        # painting almost all of it outside the visible view (so the strip
+        # looks like the background only -- the symptom we saw).
+        rect_needs_update = False
+        rect_value: QRectF | None = None
         if self._scan_heat is None or len(self._scan_heat) != n_cells:
             self._scan_heat = np.zeros(n_cells, dtype=np.float32)
-            # Align the image rect to the actual cell frequency span
             centers = snapshot.cell_freq_centers_hz
             if len(centers) >= 2:
                 width = float(centers[1] - centers[0])
                 start_ghz = (float(centers[0]) - width / 2.0) / 1e9
                 stop_ghz = (float(centers[-1]) + width / 2.0) / 1e9
                 span_ghz = stop_ghz - start_ghz
-                self._prob_img.setRect(QRectF(start_ghz, 0, span_ghz, 1))
-                self._scan_img.setRect(QRectF(start_ghz, 0, span_ghz, 1))
-                # Zoom to the active sweep window (may be narrower than the grid)
-                self._update_activity_map_ranges()
+                rect_value = QRectF(start_ghz, 0, span_ghz, 1)
+                rect_needs_update = True
 
         # --- Probability strip (gamma-lifted for visibility) ---
         prob = np.clip(occ.astype(np.float32), 0.0, 1.0)
         prob_disp = np.power(prob, PROB_DISPLAY_GAMMA)
-        self._prob_img.setImage(prob_disp.reshape(n_cells, 1),
+        axis_order = pg.getConfigOption("imageAxisOrder")
+        # Build a proper 2D image a few rows tall (cells along the frequency
+        # axis, N_MAP_ROWS rows in the orthogonal axis). A 1-pixel-tall image
+        # can be dropped/mis-scaled by the live ViewBox, which made the strip
+        # look uniform even though the data varied per cell.
+        self._prob_img.setImage(_strip_image(prob_disp, axis_order),
                                 autoLevels=False, levels=(0, 1))
+        if rect_needs_update and rect_value is not None:
+            self._prob_img.setRect(rect_value)
 
         # --- Scan coverage strip: heat derived from per-cell scan age ---
         # heat = exp(-age / tau): a cell scanned just now is ~1.0 and fades to
@@ -2400,10 +2448,86 @@ class DroneDetector(QMainWindow):
             heat = self._scan_heat
 
         heat_disp = np.power(np.clip(heat, 0.0, 1.0), SCAN_DISPLAY_GAMMA)
-        self._scan_img.setImage(heat_disp.reshape(n_cells, 1),
+        self._scan_img.setImage(_strip_image(heat_disp, axis_order),
                                 autoLevels=False, levels=(0, 1))
+        if rect_needs_update and rect_value is not None:
+            self._scan_img.setRect(rect_value)
+            # Zoom to the active sweep window now that the rect matches data
+            self._update_activity_map_ranges()
 
+        self._dbg_prob_disp = prob_disp
+        self._dbg_heat_disp = heat_disp
+        self._update_map_debug_overlay(snapshot, prob, prob_disp, heat, heat_disp, axis_order)
         self._log_map_colors(occ, prob_disp, heat, heat_disp)
+
+    def _grab_map_snapshot(self):
+        """Save two PNGs every few seconds:
+          (a) live_*.png: the ACTUAL map widget as painted on screen (the
+              ground-truth of what the user sees).
+          (b) data_*.png: a strip built directly from the data + LUT (what the
+              colors SHOULD look like). Comparing the two pinpoints whether the
+              issue is data, colormap, or live ViewBox rendering."""
+        if not MAP_DEBUG_OVERLAY:
+            return
+        import time as _t
+        now = _t.time()
+        if now - getattr(self, "_last_grab", 0.0) < 3.0:
+            return
+        prob = getattr(self, "_dbg_prob_disp", None)
+        heat = getattr(self, "_dbg_heat_disp", None)
+        if prob is None or heat is None:
+            return
+        self._last_grab = now
+        try:
+            import os
+            from PyQt5.QtGui import QImage
+            os.makedirs("spectrum_logs", exist_ok=True)
+
+            # (a) live widget grab — what the user actually sees.
+            if hasattr(self, "_prob_plot") and self._prob_plot is not None:
+                self._prob_plot.grab().save(
+                    os.path.join("spectrum_logs", "live_prob.png"))
+                self._scan_plot.grab().save(
+                    os.path.join("spectrum_logs", "live_scan.png"))
+
+            # (b) data + LUT strip — what colors the colormap maps to.
+            def save_data_strip(values, lut, path):
+                n = len(values)
+                idx = np.clip((values * (len(lut) - 1)).astype(int), 0, len(lut) - 1)
+                rgb = lut[idx][:, :3].astype(np.uint8)
+                strip = np.repeat(rgb[np.newaxis, :, :], 24, axis=0)
+                strip = np.ascontiguousarray(strip)
+                h, w = strip.shape[0], strip.shape[1]
+                qimg = QImage(strip.data, w, h, 3 * w, QImage.Format_RGB888)
+                qimg.copy().save(path)
+
+            save_data_strip(np.clip(prob, 0, 1), _probability_colormap(),
+                            os.path.join("spectrum_logs", "data_prob.png"))
+            save_data_strip(np.clip(heat, 0, 1), _scan_colormap(),
+                            os.path.join("spectrum_logs", "data_scan.png"))
+        except Exception:
+            pass
+
+    def _update_map_debug_overlay(self, snapshot, prob, prob_disp, heat, heat_disp, axis_order):
+        if not MAP_DEBUG_OVERLAY:
+            return
+        try:
+            top_i = int(np.argmax(prob))
+            top_f = snapshot.cell_freq_centers_hz[top_i] / 1e9
+            self._prob_dbg_text.setText(
+                f"axis={axis_order}  raw[min/med/max]={prob.min():.3f}/{np.median(prob):.3f}/{prob.max():.3f}\n"
+                f"disp[min/med/max]={prob_disp.min():.3f}/{np.median(prob_disp):.3f}/{prob_disp.max():.3f}\n"
+                f"top=cell#{top_i} @{top_f:.3f}GHz p={prob[top_i]:.3f}"
+            )
+            top_h = int(np.argmax(heat))
+            top_hf = snapshot.cell_freq_centers_hz[top_h] / 1e9
+            self._scan_dbg_text.setText(
+                f"axis={axis_order}  raw[min/med/max]={heat.min():.3f}/{np.median(heat):.3f}/{heat.max():.3f}\n"
+                f"disp[min/med/max]={heat_disp.min():.3f}/{np.median(heat_disp):.3f}/{heat_disp.max():.3f}\n"
+                f"top=cell#{top_h} @{top_hf:.3f}GHz h={heat[top_h]:.3f}"
+            )
+        except Exception:
+            pass
 
     def _log_map_colors(self, prob, prob_disp, heat, heat_disp):
         """Periodically log render-level values (raw value, gamma-lifted value,
@@ -2449,6 +2573,7 @@ class DroneDetector(QMainWindow):
 
     # -------------------------------------------------- Display update
     def _update_display(self):
+        self._grab_map_snapshot()
         cur = self.sweep_worker.current_freq
         if cur > 0:
             # When engine is running, also show scan count
