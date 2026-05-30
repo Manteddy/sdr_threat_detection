@@ -392,11 +392,26 @@ class SpectrumEngine:
             med = float(np.median(psd_primary))
             psd_primary[max(0, mid - 1):mid + 2] = med
 
-        # Stage RECEIVE: tune + acquire already happened upstream
-        # (scheduler picked, backend captured). We drop IQ here — no PSD,
-        # no display update, no cell state, no processor. Use case is the
-        # "raw signal is flowing" diagnostic at the bottom of the ladder.
+        # Stage RECEIVE: show the raw single-FFT spectrum without any
+        # processing — no DC excision, no Welch averaging, no cell state,
+        # no baseline, no processor. The display is intentionally "dirty":
+        # the LO-leakage DC spike is visible, noise is unsuppressed.
+        # This is a diagnostic view — "what the ADC actually handed us."
+        #
+        # We recompute a fresh coarse PSD here from the un-excised IQ so
+        # the display reflects the true raw capture. The Welch/excised
+        # psd_primary computed above (used at PROCESS+) is not touched.
         if self.stage <= EngineStage.RECEIVE:
+            raw_psd = coarse_psd_db(
+                capture.omni_iq,
+                fft_size=cfg.coarse_scan.fft_size,
+            )
+            raw_f_ax = freq_axis_hz(
+                capture.center_hz,
+                capture.bandwidth_hz,
+                cfg.coarse_scan.fft_size,
+            )
+            self._update_display_buffer(raw_psd, raw_f_ax)
             self._scan_count += 1
             snapshot = self._make_snapshot(capture_time, groups)
             self._last_snapshot = snapshot
