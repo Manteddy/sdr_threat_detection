@@ -30,7 +30,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QSlider, QGroupBox, QCheckBox,
     QScrollArea, QFrame, QSplitter, QLineEdit, QDoubleSpinBox, QSpinBox,
-    QComboBox,
+    QComboBox, QButtonGroup,
 )
 from PyQt5.QtCore import QTimer, Qt, QRectF, QThread, pyqtSignal
 from PyQt5.QtGui import QFont
@@ -41,7 +41,12 @@ from proximity_alert.widget import ProximityAlertPanel
 
 # ---- Adaptive Spectrum Sensing Engine ----
 try:
-    from spectrum_engine import SpectrumEngine, EngineSnapshot, SignalReader
+    from spectrum_engine import (
+        SpectrumEngine,
+        EngineSnapshot,
+        EngineStage,
+        SignalReader,
+    )
     from spectrum_engine.sources.pyadi import PyAdiIQSource
     from spectrum_engine.config import load_config as _load_engine_config
     from spectrum_engine.tracks import TrackState
@@ -842,21 +847,30 @@ class DroneDetector(QMainWindow):
         else:
             self.proc_combo = None
 
-        self.connect_btn = QPushButton("Receiver On")
-        self.connect_btn.setFixedWidth(140)
-        self.connect_btn.clicked.connect(self.try_connect)
-        top.addWidget(self.connect_btn)
+        # ---- Four-stage segmented control (replaces Connect + Detect) ----
+        top.addSpacing(8)
+        self._stage_buttons = {}
+        self._stage_group = QButtonGroup(self)
+        self._stage_group.setExclusive(True)
+        for idx, stage in enumerate(
+            [EngineStage.IDLE, EngineStage.RECEIVE,
+             EngineStage.PROCESS, EngineStage.CLASSIFY]
+        ):
+            btn = QPushButton(stage.name.title())
+            btn.setFixedWidth(105)
+            btn.setCheckable(True)
+            btn.setProperty("stage", int(stage))
+            btn.clicked.connect(
+                lambda _checked=False, s=stage: self._on_stage_clicked(s)
+            )
+            self._stage_group.addButton(btn, idx)
+            self._stage_buttons[stage] = btn
+            top.addWidget(btn)
 
-        # Detect toggle (default OFF — operator opts in to detection)
-        self.detect_btn = QPushButton("Detect: OFF")
-        self.detect_btn.setFixedWidth(120)
-        self.detect_btn.setCheckable(True)
-        self.detect_btn.setChecked(False)
-        self.detect_btn.toggled.connect(self._on_detect_toggled)
-        top.addWidget(self.detect_btn)
-
-        self._refresh_primary_button_label()
-        self._refresh_detect_button_label()
+        # Tracks the *requested* stage (mirrors engine.stage when connected).
+        self._stage: "EngineStage" = EngineStage.IDLE
+        self._stage_buttons[EngineStage.IDLE].setChecked(True)
+        self._refresh_stage_buttons()
         root.addLayout(top)
 
         # ---- Controls bar row 1 ----
@@ -1908,6 +1922,44 @@ class DroneDetector(QMainWindow):
         if self._engine is None:
             return
         self._engine.set_detection_enabled(self._detect_enabled)
+
+    # ------------------------------------------------------------ Stage ladder
+    def _on_stage_clicked(self, stage):
+        """Stub for Phase B — Phase C replaces this with full transitions."""
+        if stage == self._stage:
+            return
+        self._stage = stage
+        self._refresh_stage_buttons()
+
+    def _refresh_stage_buttons(self):
+        """Repaint the segmented control: active stage + all to its left filled."""
+        if not hasattr(self, "_stage_buttons"):
+            return
+        # Per-stage colour palette. Background when filled (active), and the
+        # text colour. Inactive buttons use the dim default style.
+        palette = {
+            EngineStage.IDLE:     ("#3a3a3a", "#bbbbbb", "#666666"),
+            EngineStage.RECEIVE:  ("#0a4a4a", "#66ffff", "#226666"),
+            EngineStage.PROCESS:  ("#0a4a0a", "#88ff88", "#226622"),
+            EngineStage.CLASSIFY: ("#5a3000", "#ffcc66", "#885a00"),
+        }
+        current = int(self._stage)
+        for stage_val, btn in self._stage_buttons.items():
+            is_active = int(stage_val) <= current
+            bg, fg, border = palette[stage_val]
+            if is_active:
+                btn.setStyleSheet(
+                    f"QPushButton{{background:{bg};color:{fg};"
+                    f"border:1px solid {border};padding:5px;font-weight:bold;}}"
+                )
+            else:
+                btn.setStyleSheet(
+                    "QPushButton{background:#1e1e26;color:#666;"
+                    "border:1px solid #333;padding:5px;}"
+                    "QPushButton:hover{background:#28283a;color:#999;}"
+                )
+            # Sync the checkable state — only the CURRENT stage is checked.
+            btn.setChecked(int(stage_val) == current)
 
     def _reset_buffers(self):
         self.spectrum_omni[:] = DB_MIN
