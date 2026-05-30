@@ -384,13 +384,16 @@ class SpectrumEngine:
         psd_primary = psd_o
 
         # Excise the DC spike: PlutoSDR leaks the LO into the center FFT bin
-        # (huge, present in EVERY capture). Left in, it falsely lights up the
-        # cell at each window center and saturates the activity map. Replace the
-        # center bins with the local median so they read as noise.
+        # on every capture. The Blackman window spreads the spike into the
+        # two adjacent bins as sidelobes (~-20 dB, still -48 dBFS on a
+        # -28 dBFS spike vs a noise floor at -105 dBFS). The original 3-bin
+        # window (mid-1 to mid+1) left those sidelobes in, inflating peak_db
+        # by ~57 dB and permanently saturating energy_delta across the whole
+        # band. Widened to 5 bins (±2) to cover the first sidelobe pair.
         if psd_primary.size > 8:
             mid = psd_primary.size // 2
             med = float(np.median(psd_primary))
-            psd_primary[max(0, mid - 1):mid + 2] = med
+            psd_primary[max(0, mid - 2):mid + 3] = med
 
         # Stage RECEIVE: show the raw single-FFT spectrum without any
         # processing — no DC excision, no Welch averaging, no cell state,
@@ -414,10 +417,23 @@ class SpectrumEngine:
             self._update_display_buffer(raw_psd, raw_f_ax)
             # Tell the scheduler this window was visited so it advances
             # to the next cell instead of re-scanning the same one forever.
-            # Occupancy / baseline / state are intentionally NOT updated.
+            # Full occupancy / state updates are intentionally skipped.
+            #
+            # We DO pre-initialise baseline_db for cells seeing their very
+            # first scan. Without this, RECEIVE stamps last_scan_time > 0
+            # which breaks the "if last_scan_time == 0" guard in
+            # update_baseline, causing PROCESS to start the EWMA from the
+            # -100 dBFS sentinel instead of the real noise floor. That
+            # inflates energy_delta for every cell during the warm-up
+            # window and degrades scheduler prioritisation.
+            raw_noise = float(np.percentile(raw_psd, 30))
             for cell in map_measurement_to_cells(
                 cmd.center_hz, cmd.bandwidth_hz, self.cells
             ):
+                if cell.last_scan_time == 0.0:
+                    # First visit — snap baseline to real noise floor.
+                    cell.baseline_db = raw_noise
+                    cell.baseline_var_db = 5.0
                 cell.last_scan_time = capture_time
             self._scan_count += 1
             snapshot = self._make_snapshot(capture_time, groups)
