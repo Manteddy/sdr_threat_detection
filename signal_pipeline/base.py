@@ -21,7 +21,7 @@ import numpy as np
 if TYPE_CHECKING:
     from spectrum_engine.config import EngineConfig
     from spectrum_engine.detectors import FineMeasurement
-    from spectrum_engine.sdr_backend import IQCapture
+    from spectrum_engine.iq_source import IQCapture
 
 
 @dataclass(frozen=True)

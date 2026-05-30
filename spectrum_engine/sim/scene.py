@@ -2,8 +2,8 @@
 Scene + Emitter dataclasses for the SDR simulator.
 
 A Scene is an immutable description of what RF energy exists in the air at
-a given moment. The SimulatedSDRBackend uses it to synthesise IQ in
-response to each engine capture call.
+a given moment. The SimulatedIQSource uses it to synthesise IQ in
+response to each SignalReader capture call.
 """
 
 from __future__ import annotations

@@ -41,8 +41,8 @@ from proximity_alert.widget import ProximityAlertPanel
 
 # ---- Adaptive Spectrum Sensing Engine ----
 try:
-    from spectrum_engine import SpectrumEngine, EngineSnapshot
-    from spectrum_engine.sdr_backend import SDRBackend
+    from spectrum_engine import SpectrumEngine, EngineSnapshot, SignalReader
+    from spectrum_engine.sources.pyadi import PyAdiIQSource
     from spectrum_engine.config import load_config as _load_engine_config
     from spectrum_engine.tracks import TrackState
     HAS_ENGINE = True
@@ -53,7 +53,7 @@ except Exception as _eng_err:
 # ---- SDR Simulator (no libiio / pyadi-iio dependency) ----
 HAS_SIM = False
 try:
-    from spectrum_engine.sim import SimulatedSDRBackend
+    from spectrum_engine.sim import SimulatedIQSource
     from spectrum_engine.sim import scenarios as sim_scenarios
     HAS_SIM = True
 except Exception:
@@ -468,7 +468,7 @@ class SweepWorker(QThread):
             self.fastlock = fastlock
 
     def configure_engine(self, engine, backend):
-        """Attach a SpectrumEngine + SDRBackend to use the adaptive scan loop."""
+        """Attach a SpectrumEngine + SignalReader to use the adaptive scan loop."""
         self._engine = engine
         self._backend = backend
 
@@ -1646,8 +1646,12 @@ class DroneDetector(QMainWindow):
                 try:
                     eng_cfg = _load_engine_config()
                     self._engine = SpectrumEngine(cfg=eng_cfg, telemetry_enabled=True)
-                    self._engine_backend = SDRBackend(
-                        self.sdr, eng_cfg, dual_channel=self.dual_channel,
+                    # SignalReader is the single capture function shared
+                    # with the simulator path. PyAdiIQSource handles only
+                    # raw IQ acquisition from the Pluto.
+                    self._engine_backend = SignalReader(
+                        PyAdiIQSource(self.sdr, eng_cfg),
+                        eng_cfg,
                     )
                     self._engine.attach_backend(self._engine_backend)
                     # Apply the GUI's currently-selected signal processor.
@@ -1720,7 +1724,7 @@ class DroneDetector(QMainWindow):
 
     # ------------------------------------------------------------ Simulator
     def _connect_simulator(self):
-        """Spin up the engine against a SimulatedSDRBackend instead of pyadi-iio."""
+        """Spin up the engine against a simulated IQ source instead of pyadi-iio."""
         if not (HAS_SIM and HAS_ENGINE):
             self.status_label.setText("Simulator unavailable (needs spectrum_engine + sim)")
             self.status_label.setStyleSheet("color:#f44;")
@@ -1760,10 +1764,12 @@ class DroneDetector(QMainWindow):
             )
 
             self._engine = SpectrumEngine(cfg=eng_cfg, telemetry_enabled=True)
-            self._engine_backend = SimulatedSDRBackend(
-                eng_cfg, scene,
-                seed=42, dual_channel=False,
-                add_dc_spike=True, realtime=True,
+            # Same SignalReader pipeline as the hardware path; only the
+            # source differs.
+            self._engine_backend = SignalReader(
+                SimulatedIQSource(eng_cfg, scene, seed=42, add_dc_spike=True),
+                eng_cfg,
+                realtime=True,
             )
             self._engine.attach_backend(self._engine_backend)
             self._apply_selected_processor()
@@ -1809,14 +1815,16 @@ class DroneDetector(QMainWindow):
             self._sim_preview_wf.clear()
             self._refresh_sim_preview()
         backend = self._engine_backend
-        if not isinstance(backend, SimulatedSDRBackend):
+        # The simulator path wraps a SimulatedIQSource inside a SignalReader.
+        source = getattr(backend, "source", None)
+        if not isinstance(source, SimulatedIQSource):
             return  # not in simulator mode or not connected
         label = self.scene_combo.currentText()
         try:
             new_scene = sim_scenarios.preset_by_label(label)
         except KeyError:
             return
-        backend.set_scene(new_scene)
+        source.set_scene(new_scene)
         if self.engine_status_label:
             self.engine_status_label.setText(
                 f"Sim: {label} — {len(self._engine.cells)} cells"

@@ -24,7 +24,8 @@ from .spectrum_grid import (
     mark_unsupported_cells, cells_to_occupancy_array, cells_to_freq_centers,
     CellState,
 )
-from .sdr_backend import SDRBackend, IQCapture
+from .iq_source import IQCapture
+from .signal_reader import SignalReader
 from .psd import coarse_psd_db, fine_welch_db, freq_axis_hz, channel_psd
 from .detectors import (
     compute_coarse_measurement, compute_fine_measurement,
@@ -109,7 +110,7 @@ class SpectrumEngine:
     Usage (from SweepWorker thread):
 
         engine = SpectrumEngine(cfg)
-        engine.attach_backend(SDRBackend(sdr_obj, cfg, dual_channel))
+        engine.attach_backend(SignalReader(PyAdiIQSource(sdr_obj, cfg), cfg))
         while running:
             snapshot = engine.step(now=time.monotonic())
             # emit snapshot to Qt
@@ -142,7 +143,7 @@ class SpectrumEngine:
         )
 
         # Runtime state
-        self._backend: Optional[SDRBackend] = None
+        self._backend: Optional[SignalReader] = None
         self._processor: SignalProcessor = default_processor()
         # When False, _process_capture still computes PSD and updates the
         # display buffer (so the spectrum/waterfall keep refreshing) but
@@ -192,8 +193,13 @@ class SpectrumEngine:
         except Exception:
             pass
 
-    def attach_backend(self, backend: SDRBackend) -> None:
-        """Attach a live SDRBackend and mark cells outside hardware range."""
+    def attach_backend(self, backend: SignalReader) -> None:
+        """Attach a `SignalReader` and mark cells outside hardware range.
+
+        Argument named `backend` for backward compatibility; the engine
+        treats whatever it receives as the single capture function it
+        calls every step.
+        """
         self._backend = backend
         limits = backend.get_limits()
         self._hw_max_hz = limits.max_hz
