@@ -14,9 +14,33 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from enum import IntEnum
 from typing import List, Optional, TYPE_CHECKING
 
 import numpy as np
+
+
+class EngineStage(IntEnum):
+    """Four-stage operating ladder.
+
+    Strict superset: each stage runs everything from the stages below.
+    The GUI drives this via `SpectrumEngine.set_stage`.
+
+      * IDLE     — worker thread stopped; `step()` is never called.
+      * RECEIVE  — scheduler picks + tune + acquire raw IQ, then drop.
+                   No PSD, no display update, no cell-state work, no
+                   processor. Useful as a diagnostic that data is flowing.
+      * PROCESS  — RECEIVE + PSD compute + display buffer + per-cell
+                   baseline / occupancy / state machine + activity groups.
+                   Spectrum + waterfall come alive; no tracks, no
+                   classifications.
+      * CLASSIFY — PROCESS + `processor.process_fine` on fine scans +
+                   TrackManager updates. Full detection pipeline.
+    """
+    IDLE = 0
+    RECEIVE = 1
+    PROCESS = 2
+    CLASSIFY = 3
 
 from .config import EngineConfig, load_config
 from .spectrum_grid import (
@@ -24,13 +48,19 @@ from .spectrum_grid import (
     mark_unsupported_cells, cells_to_occupancy_array, cells_to_freq_centers,
     CellState,
 )
-from .sdr_backend import SDRBackend, IQCapture
+from .iq_source import IQCapture
+from .signal_reader import SignalReader
 from .psd import coarse_psd_db, fine_welch_db, freq_axis_hz, channel_psd
 from .detectors import (
     compute_coarse_measurement, compute_fine_measurement,
     CoarseMeasurement, FineMeasurement,
 )
 from .baseline import update_baseline, update_energy_delta, update_uncertainty
+
+# Pluggable signal processor — defaults to ClassicProcessor which wraps
+# the existing compute_fine_measurement so behaviour is unchanged unless
+# the caller (typically the GUI Proc combo) swaps it out.
+from signal_pipeline import default_processor, SignalProcessor  # noqa: E402
 from .occupancy import (
     update_occupancy_probability, update_cell_state, build_activity_groups,
     ActivityGroup,
@@ -104,7 +134,7 @@ class SpectrumEngine:
     Usage (from SweepWorker thread):
 
         engine = SpectrumEngine(cfg)
-        engine.attach_backend(SDRBackend(sdr_obj, cfg, dual_channel))
+        engine.attach_backend(SignalReader(PyAdiIQSource(sdr_obj, cfg), cfg))
         while running:
             snapshot = engine.step(now=time.monotonic())
             # emit snapshot to Qt
@@ -137,7 +167,13 @@ class SpectrumEngine:
         )
 
         # Runtime state
-        self._backend: Optional[SDRBackend] = None
+        self._backend: Optional[SignalReader] = None
+        self._processor: SignalProcessor = default_processor()
+        # Operating stage (see EngineStage docstring). Default CLASSIFY
+        # keeps existing callers (headless smoke scripts) running the full
+        # pipeline without opt-in. The GUI sets IDLE at construction and
+        # advances explicitly through the stage ladder.
+        self.stage: EngineStage = EngineStage.CLASSIFY
         self._scan_count: int = 0
         self._last_snapshot: Optional[EngineSnapshot] = None
         self._last_cmd: Optional[MeasurementCommand] = None
@@ -181,12 +217,66 @@ class SpectrumEngine:
         except Exception:
             pass
 
-    def attach_backend(self, backend: SDRBackend) -> None:
-        """Attach a live SDRBackend and mark cells outside hardware range."""
+    def attach_backend(self, backend: SignalReader) -> None:
+        """Attach a `SignalReader` and mark cells outside hardware range.
+
+        Argument named `backend` for backward compatibility; the engine
+        treats whatever it receives as the single capture function it
+        calls every step.
+        """
         self._backend = backend
         limits = backend.get_limits()
         self._hw_max_hz = limits.max_hz
         mark_unsupported_cells(self.cells, limits.max_hz)
+
+    def set_processor(self, processor: SignalProcessor) -> None:
+        """Swap the fine-scan signal processor at runtime.
+
+        Safe to call while the engine loop is running — processors are
+        stateless across calls, so a swap just changes which one handles
+        the next fine measurement.
+        """
+        self._processor = processor
+
+    def get_processor(self) -> SignalProcessor:
+        return self._processor
+
+    def set_stage(self, stage: EngineStage) -> None:
+        """Switch operating stage. Safe to call live from the GUI thread.
+
+        Each `step()` re-reads `self.stage`, so the change takes effect
+        at the next scan. The GUI is responsible for any state cleanup
+        that should happen on step-down transitions (drop tracks when
+        leaving CLASSIFY; reset cells when leaving PROCESS).
+        """
+        self.stage = EngineStage(int(stage))
+
+    # Back-compat alias used during the migration. New callers should
+    # call `set_stage(EngineStage.CLASSIFY | PROCESS)` directly.
+    def set_detection_enabled(self, enabled: bool) -> None:
+        self.stage = EngineStage.CLASSIFY if enabled else EngineStage.PROCESS
+
+    def reset_detection_state(self) -> None:
+        """Reset all cells to UNKNOWN, drop every track, clear groups.
+
+        Called by the GUI when Detect toggles OFF (per the answer in the
+        feature plan). Leaves baselines and noise floor estimates in
+        place — those are observations about the channel, not detections.
+        """
+        for cell in self.cells:
+            if cell.state == CellState.UNSUPPORTED:
+                continue
+            cell.state = CellState.UNKNOWN
+            cell.occupancy_prob = 0.01
+            # log-odds form must follow the prob field
+            cell.occupancy_logodds = float(np.log(0.01 / 0.99))
+            cell.energy_delta_db = 0.0
+            cell.uncertainty = 1.0
+            cell.coarse_suspicious = False
+            cell.last_strong_bins = 0
+            cell.last_occ_frac = 0.0
+            cell.last_peak_excess_db = 0.0
+        self.track_mgr.clear_all()
 
     def set_active_range(self, start_hz: float, stop_hz: float) -> None:
         """
@@ -302,6 +392,31 @@ class SpectrumEngine:
             med = float(np.median(psd_primary))
             psd_primary[max(0, mid - 1):mid + 2] = med
 
+        # Stage RECEIVE: show the raw single-FFT spectrum without any
+        # processing — no DC excision, no Welch averaging, no cell state,
+        # no baseline, no processor. The display is intentionally "dirty":
+        # the LO-leakage DC spike is visible, noise is unsuppressed.
+        # This is a diagnostic view — "what the ADC actually handed us."
+        #
+        # We recompute a fresh coarse PSD here from the un-excised IQ so
+        # the display reflects the true raw capture. The Welch/excised
+        # psd_primary computed above (used at PROCESS+) is not touched.
+        if self.stage <= EngineStage.RECEIVE:
+            raw_psd = coarse_psd_db(
+                capture.omni_iq,
+                fft_size=cfg.coarse_scan.fft_size,
+            )
+            raw_f_ax = freq_axis_hz(
+                capture.center_hz,
+                capture.bandwidth_hz,
+                cfg.coarse_scan.fft_size,
+            )
+            self._update_display_buffer(raw_psd, raw_f_ax)
+            self._scan_count += 1
+            snapshot = self._make_snapshot(capture_time, groups)
+            self._last_snapshot = snapshot
+            return snapshot
+
         # --- 5. Update cells touched by this measurement ---
         affected = map_measurement_to_cells(
             cmd.center_hz, cmd.bandwidth_hz, self.cells,
@@ -365,11 +480,26 @@ class SpectrumEngine:
             now=capture_time,
         )
 
+        # Stage PROCESS: PSD + display + cell-state machine ran above;
+        # we stop short of the processor and TrackManager.
+        if self.stage <= EngineStage.PROCESS:
+            self._update_display_buffer(psd_primary, f_ax)
+            self._scan_count += 1
+            snapshot = self._make_snapshot(capture_time, groups)
+            self._last_snapshot = snapshot
+            return snapshot
+
+        # Stage CLASSIFY: full pipeline.
         # --- 7. Fine detection → region → track update ---
         if cmd.is_fine:
-            fine_meas = compute_fine_measurement(
-                psd_primary, f_ax, capture.timestamp,
-                cmd.center_hz, cmd.bandwidth_hz, cfg,
+            # Dispatch through the pluggable processor. The default
+            # (ClassicProcessor) just calls compute_fine_measurement,
+            # preserving previous behaviour byte-for-byte.
+            fine_meas = self._processor.process_fine(
+                capture=capture,
+                psd_db=psd_primary,
+                freq_axis_hz=f_ax,
+                cfg=cfg,
             )
             self.track_mgr.update_from_regions(fine_meas.detected_regions, capture_time)
 

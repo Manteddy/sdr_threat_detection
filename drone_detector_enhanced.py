@@ -29,7 +29,8 @@ from collections import deque
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QSlider, QGroupBox, QCheckBox,
-    QScrollArea, QFrame, QSplitter, QLineEdit, QDoubleSpinBox, QSpinBox
+    QScrollArea, QFrame, QSplitter, QLineEdit, QDoubleSpinBox, QSpinBox,
+    QComboBox, QButtonGroup,
 )
 from PyQt5.QtCore import QTimer, Qt, QRectF, QThread, pyqtSignal
 from PyQt5.QtGui import QFont
@@ -40,14 +41,36 @@ from proximity_alert.widget import ProximityAlertPanel
 
 # ---- Adaptive Spectrum Sensing Engine ----
 try:
-    from spectrum_engine import SpectrumEngine, EngineSnapshot
-    from spectrum_engine.sdr_backend import SDRBackend
+    from spectrum_engine import (
+        SpectrumEngine,
+        EngineSnapshot,
+        EngineStage,
+        SignalReader,
+    )
+    from spectrum_engine.sources.pyadi import PyAdiIQSource
     from spectrum_engine.config import load_config as _load_engine_config
     from spectrum_engine.tracks import TrackState
     HAS_ENGINE = True
 except Exception as _eng_err:
     HAS_ENGINE = False
     _eng_err_msg = str(_eng_err)
+
+# ---- SDR Simulator (no libiio / pyadi-iio dependency) ----
+HAS_SIM = False
+try:
+    from spectrum_engine.sim import SimulatedIQSource
+    from spectrum_engine.sim import scenarios as sim_scenarios
+    HAS_SIM = True
+except Exception:
+    pass
+
+# ---- Pluggable signal-processing algorithms ----
+HAS_PIPELINE = False
+try:
+    from signal_pipeline import list_processors, get_processor
+    HAS_PIPELINE = True
+except Exception:
+    pass
 
 # ---- Optional acceleration ----
 HAS_NUMBA = False
@@ -450,7 +473,7 @@ class SweepWorker(QThread):
             self.fastlock = fastlock
 
     def configure_engine(self, engine, backend):
-        """Attach a SpectrumEngine + SDRBackend to use the adaptive scan loop."""
+        """Attach a SpectrumEngine + SignalReader to use the adaptive scan loop."""
         self._engine = engine
         self._backend = backend
 
@@ -659,8 +682,36 @@ class DroneDetector(QMainWindow):
 
         self.fastlock = FastlockManager()
 
+        # --- Sim preview panel state ---------------------------------
+        # The right-hand column (formerly RX2 directional antenna view)
+        # is repurposed as a continuous ground-truth view of whatever
+        # simulator scene is currently selected. Driven by a separate
+        # timer; the main display update loop does NOT write to it.
+        self._sim_preview_n_bins = 2048
+        self._sim_preview_start_ghz = 1.0
+        self._sim_preview_stop_ghz = 6.5
+        self._sim_preview_freq_ghz = np.linspace(
+            self._sim_preview_start_ghz, self._sim_preview_stop_ghz,
+            self._sim_preview_n_bins, dtype=np.float64,
+        )
+        self._sim_preview_psd_db = np.full(
+            self._sim_preview_n_bins, DB_MIN, dtype=np.float32,
+        )
+        self._sim_preview_wf = deque(maxlen=DEFAULT_WF_LINES)
+        self._sim_preview_rng = np.random.default_rng(42)
+        self._sim_preview_active = False
+        # Stage ladder (see EngineStage). The GUI walks Idle → Receive →
+        # Process → Classify via the segmented control. _set_stage drives
+        # the engine + worker; this attribute is the GUI's mirror.
+        # Assigned again in _setup_ui after the buttons exist, but the
+        # default needs to be defined here so _on_source_changed etc. are
+        # safe to call before the UI is built.
+        self._stage = None  # filled in by _setup_ui
+        # ------------------------------------------------------------
+
         self._setup_ui()
         self._setup_plots()
+        self._setup_sim_preview_panel()
         self._setup_crosshairs()
         self._setup_alert_window()
 
@@ -670,6 +721,8 @@ class DroneDetector(QMainWindow):
         self.sweep_worker.error_occurred.connect(self._on_sweep_error)
         self.update_timer = QTimer(self)
         self.update_timer.timeout.connect(self._update_display)
+        self._sim_preview_timer = QTimer(self)
+        self._sim_preview_timer.timeout.connect(self._refresh_sim_preview)
 
     # -------------------------------------------------------- Sweep math
     def _recalc_sweep(self):
@@ -753,14 +806,75 @@ class DroneDetector(QMainWindow):
         self.freq_label.setStyleSheet("color:#0ff;padding:2px;")
         top.addWidget(self.freq_label)
 
-        self.connect_btn = QPushButton("Connect")
-        self.connect_btn.setFixedWidth(100)
-        self.connect_btn.setStyleSheet(
-            "QPushButton{background:#2a2a4a;color:#0f0;border:1px solid #444;padding:4px;}"
-            "QPushButton:hover{background:#3a3a5a;}"
-        )
-        self.connect_btn.clicked.connect(self.try_connect)
-        top.addWidget(self.connect_btn)
+        # ---- Source selector (Hardware vs Simulator) ----
+        top.addWidget(self._lbl("Src:"))
+        self.source_combo = QComboBox()
+        self.source_combo.addItem("Hardware")
+        if HAS_SIM and HAS_ENGINE:
+            self.source_combo.addItem("Simulator")
+        self.source_combo.setFixedWidth(100)
+        self.source_combo.setStyleSheet(INPUT_STYLE)
+        self.source_combo.currentIndexChanged.connect(self._on_source_changed)
+        top.addWidget(self.source_combo)
+
+        # ---- Simulator scene preset (runtime-switchable) ----
+        if HAS_SIM and HAS_ENGINE:
+            top.addWidget(self._lbl(" Scene:"))
+            self.scene_combo = QComboBox()
+            for label, _ in sim_scenarios.GUI_PRESETS:
+                self.scene_combo.addItem(label)
+            default_idx = next(
+                (i for i, (lbl, _) in enumerate(sim_scenarios.GUI_PRESETS)
+                 if "5.8 GHz" in lbl),
+                0,
+            )
+            self.scene_combo.setCurrentIndex(default_idx)
+            self.scene_combo.setFixedWidth(210)
+            self.scene_combo.setStyleSheet(INPUT_STYLE)
+            self.scene_combo.setEnabled(False)  # only meaningful in Simulator mode
+            self.scene_combo.currentIndexChanged.connect(self._on_scene_changed)
+            top.addWidget(self.scene_combo)
+        else:
+            self.scene_combo = None
+
+        # ---- Signal-processing algorithm selector (runtime-switchable) ----
+        if HAS_PIPELINE and HAS_ENGINE:
+            top.addWidget(self._lbl(" Proc:"))
+            self.proc_combo = QComboBox()
+            for name, label in list_processors():
+                self.proc_combo.addItem(label, userData=name)
+            self.proc_combo.setCurrentIndex(0)  # default = Classic
+            self.proc_combo.setFixedWidth(180)
+            self.proc_combo.setStyleSheet(INPUT_STYLE)
+            self.proc_combo.currentIndexChanged.connect(self._on_proc_changed)
+            top.addWidget(self.proc_combo)
+        else:
+            self.proc_combo = None
+
+        # ---- Four-stage segmented control (replaces Connect + Detect) ----
+        top.addSpacing(8)
+        self._stage_buttons = {}
+        self._stage_group = QButtonGroup(self)
+        self._stage_group.setExclusive(True)
+        for idx, stage in enumerate(
+            [EngineStage.IDLE, EngineStage.RECEIVE,
+             EngineStage.PROCESS, EngineStage.CLASSIFY]
+        ):
+            btn = QPushButton(stage.name.title())
+            btn.setFixedWidth(105)
+            btn.setCheckable(True)
+            btn.setProperty("stage", int(stage))
+            btn.clicked.connect(
+                lambda _checked=False, s=stage: self._on_stage_clicked(s)
+            )
+            self._stage_group.addButton(btn, idx)
+            self._stage_buttons[stage] = btn
+            top.addWidget(btn)
+
+        # Tracks the *requested* stage (mirrors engine.stage when connected).
+        self._stage: "EngineStage" = EngineStage.IDLE
+        self._stage_buttons[EngineStage.IDLE].setChecked(True)
+        self._refresh_stage_buttons()
         root.addLayout(top)
 
         # ---- Controls bar row 1 ----
@@ -1183,6 +1297,98 @@ class DroneDetector(QMainWindow):
             wf_widget.addItem(img)
             setattr(self, attr_img, img)
 
+    def _setup_sim_preview_panel(self):
+        """Take over the RX2 column as the simulator ground-truth preview.
+
+        The widgets keep their old variable names (spec_dir, wf_dir,
+        spec_dir_curve, wf_dir_img) — only the title, X range, data, and
+        overlays change. The main display update loop no longer writes to
+        them; they are driven by `_refresh_sim_preview` exclusively.
+        """
+        self.spec_dir.setTitle(
+            "Simulated Signal (1.0–6.5 GHz)", color="w", size="10pt",
+        )
+        self.spec_dir.setXRange(
+            self._sim_preview_start_ghz, self._sim_preview_stop_ghz, padding=0,
+        )
+        # Re-seed the curve with the sim-preview frequency axis + empty data.
+        self.spec_dir_curve.setData(
+            self._sim_preview_freq_ghz, self._sim_preview_psd_db,
+        )
+        # Detection overlays belonged to the RX2 antenna view; hide them.
+        if hasattr(self, "cfar_dir_curve"):
+            self.cfar_dir_curve.setVisible(False)
+        if hasattr(self, "thresh_line_dir"):
+            self.thresh_line_dir.setVisible(False)
+        if hasattr(self, "_scan_target_line_dir"):
+            self._scan_target_line_dir.setVisible(False)
+        # Waterfall rect: 1.0–6.5 GHz wide, full waterfall depth tall.
+        span = self._sim_preview_stop_ghz - self._sim_preview_start_ghz
+        self.wf_dir_img.setRect(QRectF(
+            self._sim_preview_start_ghz, 0, span, self.wf_max_lines,
+        ))
+
+    def _refresh_sim_preview(self):
+        """Timer slot — render the active simulator scene's analytical PSD.
+
+        Runs while Source == Simulator and the scene_combo is populated.
+        Does nothing in Hardware mode. The detection state of the engine
+        is irrelevant here — this view is ground truth of the air.
+        """
+        if not (self._sim_preview_active and HAS_SIM):
+            return
+        if self.scene_combo is None:
+            return
+        try:
+            scene = sim_scenarios.preset_by_label(self.scene_combo.currentText())
+        except KeyError:
+            return
+        from spectrum_engine.sim import scene_psd_db
+        _, psd = scene_psd_db(
+            scene,
+            self._sim_preview_start_ghz * 1e9,
+            self._sim_preview_stop_ghz * 1e9,
+            self._sim_preview_n_bins,
+            rng=self._sim_preview_rng,
+        )
+        self._sim_preview_psd_db = psd
+        self.spec_dir_curve.setData(self._sim_preview_freq_ghz, psd)
+        # Waterfall — same normalization conventions as the omni waterfall.
+        self._sim_preview_wf.append(psd.copy())
+        if len(self._sim_preview_wf) >= 2:
+            wf = np.array(list(self._sim_preview_wf), dtype=np.float32)
+            nf = _clamp(self.reference_noise_floor, -140, -20, -80)
+            wf_n = np.clip((wf - nf) / DYNAMIC_RANGE, 0, 1)
+            self.wf_dir_img.setImage(wf_n.T, autoLevels=False, levels=(0, 1))
+            span = self._sim_preview_stop_ghz - self._sim_preview_start_ghz
+            self.wf_dir_img.setRect(QRectF(
+                self._sim_preview_start_ghz, 0, span, len(self._sim_preview_wf),
+            ))
+            self.wf_dir.setYRange(0, len(self._sim_preview_wf))
+
+    def _activate_sim_preview(self):
+        """Show + start refreshing the sim preview (called when Src=Simulator)."""
+        self._sim_preview_active = True
+        self._sim_preview_wf.clear()
+        # 5 Hz refresh — light, plenty for static scenes; visible motion when
+        # the scene gets time-varying (drone_approach style scenarios).
+        if not self._sim_preview_timer.isActive():
+            self._sim_preview_timer.start(200)
+        # Run one refresh immediately so the user sees the picked scene
+        # without waiting up to 200 ms.
+        self._refresh_sim_preview()
+
+    def _deactivate_sim_preview(self):
+        """Stop the timer and blank the panel (Hardware mode / startup)."""
+        self._sim_preview_active = False
+        if self._sim_preview_timer.isActive():
+            self._sim_preview_timer.stop()
+        self._sim_preview_psd_db[:] = DB_MIN
+        self.spec_dir_curve.setData(
+            self._sim_preview_freq_ghz, self._sim_preview_psd_db,
+        )
+        self._sim_preview_wf.clear()
+
     def _setup_crosshairs(self):
         self._crosshair_proxies = []
         self._crosshair_items = {}
@@ -1299,13 +1505,14 @@ class DroneDetector(QMainWindow):
         self._alert_window.show()
 
     # -------------------------------------------------------- Connection
-    def try_connect(self):
+    def _connect_hardware(self, target_stage=None):
+        target_stage = target_stage if target_stage is not None else EngineStage.CLASSIFY
         try:
             import adi
         except (ImportError, TypeError, OSError):
             self.status_label.setText("Error: pip install pyadi-iio (needs libiio)")
             self.status_label.setStyleSheet("color:#f44;")
-            return
+            return False
 
         try:
             if self.sdr:
@@ -1432,9 +1639,6 @@ class DroneDetector(QMainWindow):
                 f"{self.sweep_end_hz/1e9:.3f} GHz ({self.num_steps} steps)"
             )
             self.status_label.setStyleSheet("color:#0f0;")
-            self.connect_btn.setText("Disconnect")
-            self.connect_btn.clicked.disconnect()
-            self.connect_btn.clicked.connect(self._disconnect)
 
             self._reset_buffers()
             self.sweep_worker.configure(
@@ -1450,19 +1654,26 @@ class DroneDetector(QMainWindow):
                 try:
                     eng_cfg = _load_engine_config()
                     self._engine = SpectrumEngine(cfg=eng_cfg, telemetry_enabled=True)
-                    self._engine_backend = SDRBackend(
-                        self.sdr, eng_cfg, dual_channel=self.dual_channel,
+                    # SignalReader is the single capture function shared
+                    # with the simulator path. PyAdiIQSource handles only
+                    # raw IQ acquisition from the Pluto.
+                    self._engine_backend = SignalReader(
+                        PyAdiIQSource(self.sdr, eng_cfg),
+                        eng_cfg,
                     )
                     self._engine.attach_backend(self._engine_backend)
-                    # Honour the currently-selected sweep window
+                    self._apply_selected_processor()
+                    self._engine.set_stage(target_stage)
                     self._engine.set_active_range(self.sweep_start_hz, self.sweep_end_hz)
                     self.sweep_worker.configure_engine(self._engine, self._engine_backend)
                     if self.engine_status_label:
                         n_cells = len(self._engine.cells)
+                        proc_label = self._engine.get_processor().label
                         self.engine_status_label.setText(
                             f"Active — {n_cells} cells over "
                             f"{eng_cfg.frequency_range.start_hz/1e9:.1f}–"
-                            f"{eng_cfg.frequency_range.stop_hz/1e9:.1f} GHz"
+                            f"{eng_cfg.frequency_range.stop_hz/1e9:.1f} GHz "
+                            f"[{proc_label}]"
                         )
                         self.engine_status_label.setStyleSheet("color:#0f0;padding:1px 4px;")
                 except Exception as eng_ex:
@@ -1474,11 +1685,13 @@ class DroneDetector(QMainWindow):
 
             self.sweep_worker.start()
             self.update_timer.start(80)
+            return True
 
         except Exception as e:
             self.connected = False
             self.status_label.setText(f"Connection failed: {str(e)[:60]}")
             self.status_label.setStyleSheet("color:#f44;")
+            return False
 
     def _disconnect(self):
         self.sweep_worker.stop()
@@ -1500,9 +1713,6 @@ class DroneDetector(QMainWindow):
                 pass
             self.sdr = None
         self.connected = False
-        self.connect_btn.setText("Connect")
-        self.connect_btn.clicked.disconnect()
-        self.connect_btn.clicked.connect(self.try_connect)
         self.status_label.setText("Disconnected")
         self.status_label.setStyleSheet("color:#888;")
         self.warning_label.setText("")
@@ -1515,6 +1725,228 @@ class DroneDetector(QMainWindow):
         if self.engine_tracks_label:
             self.engine_tracks_label.setText("")
         self.alert_panel.clear()
+
+    # ------------------------------------------------------------ Simulator
+    def _connect_simulator(self, target_stage=None):
+        """Spin up the engine against a simulated IQ source instead of pyadi-iio."""
+        target_stage = target_stage if target_stage is not None else EngineStage.CLASSIFY
+        if not (HAS_SIM and HAS_ENGINE):
+            self.status_label.setText("Simulator unavailable (needs spectrum_engine + sim)")
+            self.status_label.setStyleSheet("color:#f44;")
+            return False
+
+        try:
+            eng_cfg = _load_engine_config()
+            scene_label = self.scene_combo.currentText() if self.scene_combo else "Empty band (noise only)"
+            scene = sim_scenarios.preset_by_label(scene_label)
+
+            # No physical SDR — but other code paths inspect self.sdr defensively
+            self.sdr = None
+            self.dual_channel = False
+            self.connected = True
+
+            self.spec_dir.setTitle("RX2 (sim mirror)", color="#ff8800", size="9pt")
+            self.status_label.setText(
+                f"Connected (SIMULATOR: {scene_label}) - "
+                f"{self.sweep_start_hz/1e9:.3f}-{self.sweep_end_hz/1e9:.3f} GHz "
+                f"({self.num_steps} steps)"
+            )
+            self.status_label.setStyleSheet("color:#0ff;")
+
+            self._reset_buffers()
+            # Worker still needs configure() so its display buffers / features
+            # are wired up; sdr=None is fine because the simulator path uses
+            # the engine loop, never the classic loop.
+            self.sweep_worker.configure(
+                None, self.sweep_start_hz, self.num_steps,
+                False, self.spectrum_omni, self.spectrum_dir,
+                spec_omni_welch=self.spectrum_omni_welch,
+                spec_dir_welch=self.spectrum_dir_welch,
+                features=self.features, fastlock=self.fastlock,
+            )
+
+            self._engine = SpectrumEngine(cfg=eng_cfg, telemetry_enabled=True)
+            # Same SignalReader pipeline as the hardware path; only the
+            # source differs.
+            self._engine_backend = SignalReader(
+                SimulatedIQSource(eng_cfg, scene, seed=42, add_dc_spike=True),
+                eng_cfg,
+                realtime=True,
+            )
+            self._engine.attach_backend(self._engine_backend)
+            self._apply_selected_processor()
+            self._engine.set_stage(target_stage)
+            self._engine.set_active_range(self.sweep_start_hz, self.sweep_end_hz)
+            self.sweep_worker.configure_engine(self._engine, self._engine_backend)
+
+            if self.engine_status_label:
+                proc_label = self._engine.get_processor().label
+                self.engine_status_label.setText(
+                    f"Sim: {scene_label} — {len(self._engine.cells)} cells [{proc_label}]"
+                )
+                self.engine_status_label.setStyleSheet("color:#0ff;padding:1px 4px;")
+
+            self.sweep_worker.start()
+            self.update_timer.start(80)
+            return True
+
+        except Exception as e:
+            self.connected = False
+            self.status_label.setText(f"Sim connect failed: {str(e)[:60]}")
+            self.status_label.setStyleSheet("color:#f44;")
+            return False
+
+    def _on_source_changed(self, _idx):
+        """Enable scene combo + start/stop the sim preview based on source.
+
+        Changing source while a session is active forces a step down to
+        Idle — connection is owned by the stage ladder, so the operator
+        re-engages by clicking back up to Receive/Process/Classify.
+        """
+        if self.scene_combo is None:
+            return
+        is_sim = self.source_combo.currentText() == "Simulator"
+        self.scene_combo.setEnabled(is_sim)
+        if is_sim:
+            self._activate_sim_preview()
+        else:
+            self._deactivate_sim_preview()
+        if self._stage is not None and self._stage != EngineStage.IDLE:
+            self._set_stage(EngineStage.IDLE)
+
+    def _on_scene_changed(self, _idx):
+        """Live-swap the simulator's scene and refresh the preview panel."""
+        if self.scene_combo is None:
+            return
+        # Always refresh the preview, even when not connected — the user
+        # picks a scene to *see* it before hitting Simulate.
+        if self._sim_preview_active:
+            # Clear waterfall so the new scene's pattern is unmistakable.
+            self._sim_preview_wf.clear()
+            self._refresh_sim_preview()
+        backend = self._engine_backend
+        # The simulator path wraps a SimulatedIQSource inside a SignalReader.
+        source = getattr(backend, "source", None)
+        if not isinstance(source, SimulatedIQSource):
+            return  # not in simulator mode or not connected
+        label = self.scene_combo.currentText()
+        try:
+            new_scene = sim_scenarios.preset_by_label(label)
+        except KeyError:
+            return
+        source.set_scene(new_scene)
+        if self.engine_status_label:
+            self.engine_status_label.setText(
+                f"Sim: {label} — {len(self._engine.cells)} cells"
+            )
+
+    def _on_proc_changed(self, _idx):
+        """Live-swap the engine's signal processor (Classic / OS-CFAR / ...)."""
+        if not (HAS_PIPELINE and self.proc_combo is not None):
+            return
+        if self._engine is None:
+            return  # not connected; selection is applied at connect time
+        self._apply_selected_processor()
+
+    def _apply_selected_processor(self):
+        """Push the Proc combo's current selection onto the active engine."""
+        if not (HAS_PIPELINE and self.proc_combo is not None and self._engine is not None):
+            return
+        name = self.proc_combo.currentData()  # short id stored via userData
+        if not name:
+            return
+        try:
+            self._engine.set_processor(get_processor(name))
+        except KeyError:
+            return  # unknown name → leave the previous processor in place
+
+    # ------------------------------------------------------------ Stage ladder
+    def _on_stage_clicked(self, stage):
+        """Segmented control callback → drive the stage transition."""
+        self._set_stage(stage)
+
+    def _set_stage(self, target_stage):
+        """Drive the engine + worker through a stage transition.
+
+        Same-stage clicks are no-ops. Idle → active starts the source.
+        Active → Idle stops the worker and tears down the engine. Going
+        down between active stages cleans up the state that was being
+        produced at the higher stage (tracks for Classify, cell state
+        for Process) per the rule in the plan.
+        """
+        if self._stage is None:
+            # First-time init from _setup_ui.
+            self._stage = target_stage
+            self._refresh_stage_buttons()
+            return
+        if target_stage == self._stage:
+            return
+
+        old_stage = self._stage
+
+        # Idle → active: connect via the selected source.
+        if old_stage == EngineStage.IDLE and target_stage > EngineStage.IDLE:
+            src = (self.source_combo.currentText()
+                   if hasattr(self, "source_combo") else "Hardware")
+            ok = (self._connect_simulator(target_stage)
+                  if src == "Simulator" else self._connect_hardware(target_stage))
+            if not ok:
+                self._stage = EngineStage.IDLE
+                self._refresh_stage_buttons()
+                return
+            self._stage = target_stage
+            self._refresh_stage_buttons()
+            return
+
+        # Active → Idle: full teardown.
+        if old_stage > EngineStage.IDLE and target_stage == EngineStage.IDLE:
+            self._disconnect()
+            self._stage = EngineStage.IDLE
+            self._refresh_stage_buttons()
+            return
+
+        # Active → active: keep connection, just flip engine.stage.
+        # Going down cleans up state we are no longer producing.
+        if target_stage < old_stage and self._engine is not None:
+            if target_stage < EngineStage.CLASSIFY <= old_stage:
+                self._engine.track_mgr.clear_all()
+            if target_stage < EngineStage.PROCESS <= old_stage:
+                self._engine.reset_detection_state()
+
+        if self._engine is not None:
+            self._engine.set_stage(target_stage)
+        self._stage = target_stage
+        self._refresh_stage_buttons()
+
+    def _refresh_stage_buttons(self):
+        """Repaint the segmented control: active stage + all to its left filled."""
+        if not hasattr(self, "_stage_buttons"):
+            return
+        # Per-stage colour palette. Background when filled (active), and the
+        # text colour. Inactive buttons use the dim default style.
+        palette = {
+            EngineStage.IDLE:     ("#3a3a3a", "#bbbbbb", "#666666"),
+            EngineStage.RECEIVE:  ("#0a4a4a", "#66ffff", "#226666"),
+            EngineStage.PROCESS:  ("#0a4a0a", "#88ff88", "#226622"),
+            EngineStage.CLASSIFY: ("#5a3000", "#ffcc66", "#885a00"),
+        }
+        current = int(self._stage)
+        for stage_val, btn in self._stage_buttons.items():
+            is_active = int(stage_val) <= current
+            bg, fg, border = palette[stage_val]
+            if is_active:
+                btn.setStyleSheet(
+                    f"QPushButton{{background:{bg};color:{fg};"
+                    f"border:1px solid {border};padding:5px;font-weight:bold;}}"
+                )
+            else:
+                btn.setStyleSheet(
+                    "QPushButton{background:#1e1e26;color:#666;"
+                    "border:1px solid #333;padding:5px;}"
+                    "QPushButton:hover{background:#28283a;color:#999;}"
+                )
+            # Sync the checkable state — only the CURRENT stage is checked.
+            btn.setChecked(int(stage_val) == current)
 
     def _reset_buffers(self):
         self.spectrum_omni[:] = DB_MIN
@@ -2058,33 +2490,27 @@ class DroneDetector(QMainWindow):
             self.warning_label.setStyleSheet("color:transparent;")
 
         self.spec_omni_curve.setData(self.freq_axis_ghz, self.spectrum_omni)
-        self.spec_dir_curve.setData(self.freq_axis_ghz, self.spectrum_dir)
+        # spec_dir is the Simulated Signal panel — driven by
+        # _refresh_sim_preview, never overwritten here.
 
         if self.features.get("use_cfar_detection"):
             self.cfar_omni_curve.setData(self.freq_axis_ghz, self.cfar_thresh_omni)
-            self.cfar_dir_curve.setData(self.freq_axis_ghz, self.cfar_thresh_dir)
             self.cfar_omni_curve.setVisible(True)
-            self.cfar_dir_curve.setVisible(True)
         else:
             self.cfar_omni_curve.setVisible(False)
-            self.cfar_dir_curve.setVisible(False)
+        # cfar_dir_curve stays hidden — it was an RX2-antenna overlay.
 
         if self.waterfall_omni:
             nf = _clamp(self.reference_noise_floor, -140, -20, -80)
             wf_o = np.array(list(self.waterfall_omni), dtype=np.float32)
-            wf_d = np.array(list(self.waterfall_dir), dtype=np.float32)
             wf_o_n = np.clip((wf_o - nf) / DYNAMIC_RANGE, 0, 1)
-            wf_d_n = np.clip((wf_d - nf) / DYNAMIC_RANGE, 0, 1)
 
             self.wf_omni_img.setImage(wf_o_n.T, autoLevels=False, levels=(0, 1))
-            self.wf_dir_img.setImage(wf_d_n.T, autoLevels=False, levels=(0, 1))
 
             h = len(wf_o)
             span = (self.sweep_end_hz - self.sweep_start_hz) / 1e9
-            for img, wf_pw in [(self.wf_omni_img, self.wf_omni),
-                                (self.wf_dir_img, self.wf_dir)]:
-                img.setRect(QRectF(self.sweep_start_hz / 1e9, 0, span, h))
-                wf_pw.setYRange(0, h)
+            self.wf_omni_img.setRect(QRectF(self.sweep_start_hz / 1e9, 0, span, h))
+            self.wf_omni.setYRange(0, h)
 
         if SHOW_MONITOR_PANEL:
             self._update_monitor_plots()
