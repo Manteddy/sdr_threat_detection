@@ -414,6 +414,19 @@ class SpectrumEngine:
                 capture.bandwidth_hz,
                 cfg.coarse_scan.fft_size,
             )
+            # Excise the DC spike here too. RECEIVE used to show the raw
+            # PSD un-touched, but with the scheduler sweeping the band the
+            # operator ended up seeing the LO-leakage spike at the centre
+            # of every cell (~240 identical -28 dBFS peaks every 20 MHz).
+            # That visual forest of artifact peaks drowned out any real
+            # signal. The DC spike is a known hardware/sim artifact, not
+            # data -- excising it preserves the "raw" intent of RECEIVE
+            # (no Welch averaging, no baseline, no detection) while
+            # removing the misleading repeated artifact.
+            if raw_psd.size > 8:
+                mid = raw_psd.size // 2
+                med = float(np.median(raw_psd))
+                raw_psd[max(0, mid - 2):mid + 3] = med
             self._update_display_buffer(raw_psd, raw_f_ax)
             # Tell the scheduler this window was visited so it advances
             # to the next cell instead of re-scanning the same one forever.
