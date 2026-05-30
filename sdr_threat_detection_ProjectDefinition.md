@@ -17,21 +17,23 @@ Operationally there are **two data sources** (hardware or simulator) and **two d
 ## 2. High-level architecture
 
 ```
-            ┌────────────────────────────┐         ┌─────────────────────────┐
-Hardware ──►│  spectrum_engine/          │         │  signal_pipeline/       │
- (Pluto)    │  sdr_backend.SDRBackend    │         │  (plug-in processors)   │
-            │                            │         │  ──────────────────────  │
-Simulator ─►│  spectrum_engine/sim/      │         │  base.SignalProcessor   │
- (Mac/CI)   │  sim.SimulatedSDRBackend   │         │  classic.ClassicProc    │
-            └────────────┬───────────────┘         │  oscfar.OSCFARProc      │
-                         │ IQCapture                │  registry.get/list      │
-                         ▼                          └────────┬────────────────┘
-            ┌────────────────────────────────────────────────┘
+Hardware ─► PyAdiIQSource ─┐                       ┌─────────────────────────┐
+ (Pluto)                   │                       │  signal_pipeline/       │
+                           ├─► SignalReader ──IQ───┤  (plug-in processors)   │
+Simulator ─► Simulated     │   (one capture fn)    │  ──────────────────────  │
+ (Mac/CI)    IQSource  ────┘                       │  base.SignalProcessor   │
+                                                   │  classic.ClassicProc    │
+                                                   │  oscfar.OSCFARProc      │
+                                                   │  registry.get/list      │
+                                                   └────────┬────────────────┘
+            ┌───────────────────────────────────────────────┘
             │
             │   SpectrumEngine.step()
             │   ├─ Scheduler picks MeasurementCommand
-            │   ├─ backend.capture() ─► IQCapture
-            │   ├─ channel_psd()     ─► PSD
+            │   ├─ reader.capture() ─► IQCapture
+            │   │     (tune → settle → acquire → normalise →
+            │   │      anti-alias → frame → single-antenna mirror)
+            │   ├─ channel_psd()    ─► PSD
             │   ├─ if detect_enabled:
             │   │     update cells / groups / tracks
             │   │     processor.process_fine() ─► FineMeasurement
@@ -46,6 +48,12 @@ Simulator ─►│  spectrum_engine/sim/      │         │  base.SignalProce
       ├─ AlertEngine ─► ProximityAlertPanel / WebSocket
       └─ Top-bar controls: Src / Scene / Proc / Connect / Detect
 ```
+
+`SignalReader` is the **single** capture function the engine sees. It is
+the same code path for hardware and simulator — `IQSource`s do raw IQ
+acquisition only; everything else (normalisation to dBFS, anti-alias,
+framing, dual-mirror, dwell budget) lives in the reader. That is the
+contract that makes "signal is signal" hold.
 
 Three orthogonal axes the GUI exposes:
 
@@ -76,14 +84,17 @@ The receiver path is unchanged across simulator vs hardware. The only thing that
 | [signal_processing_selector_plan.md](signal_processing_selector_plan.md) | Plug-in architecture for swappable signal processors. |
 | [signal_processing_integration_plan.md](signal_processing_integration_plan.md) | OS-CFAR + classifier processor on top of the plug-in foundation. |
 | [sdr_simulator_plan.md](sdr_simulator_plan.md) | Synthetic SDR backend design (now implemented; doc still useful for context). |
+| [signal_reader_refactor_plan.md](signal_reader_refactor_plan.md) | One-`capture()` architecture across hardware + simulator (this refactor). |
 
 ### `spectrum_engine/`
 Adaptive Hierarchical Multiband Spectrum Sensing Engine.
 
 | Module | Role |
 |--------|------|
-| [engine.py](spectrum_engine/engine.py) | `SpectrumEngine.step()` orchestrates one measurement cycle. Owns cells, scheduler, tracks, telemetry, the active `SignalProcessor`, and the `detect_enabled` flag. Public hooks: `attach_backend`, `set_processor`, `set_detection_enabled`, `reset_detection_state`. Returns `EngineSnapshot`. |
-| [sdr_backend.py](spectrum_engine/sdr_backend.py) | `SDRBackend.capture(...) -> IQCapture` over pyadi-iio. Single `rx()` per scan, paranoid about libiio buffer ordering. |
+| [engine.py](spectrum_engine/engine.py) | `SpectrumEngine.step()` orchestrates one measurement cycle. Owns cells, scheduler, tracks, telemetry, the active `SignalProcessor`, and the `detect_enabled` flag. Public hooks: `attach_backend(SignalReader)`, `set_processor`, `set_detection_enabled`, `reset_detection_state`. Returns `EngineSnapshot`. |
+| [iq_source.py](spectrum_engine/iq_source.py) | `IQSource` ABC + canonical `IQCapture` / `HardwareLimits` dataclasses. Sources only do raw IQ acquisition; framing / normalisation / etc. is the reader's job. |
+| [signal_reader.py](spectrum_engine/signal_reader.py) | `SignalReader.capture(...)` — the single capture function for both hardware and simulator. Owns tune-settle, dBFS normalisation, anti-alias filtering, framing, single-antenna mirror (`dir_iq = omni_iq.copy()`), and the realtime dwell budget. |
+| [sources/pyadi.py](spectrum_engine/sources/pyadi.py) | `PyAdiIQSource` — `tune()` via `rx_lo` (destroy-buffer-first), `acquire()` via `rx()`. `rx_buffer_size` is sized once at init to `fft_size_base × max(fine_frames, coarse_frames)` to lift the historic 2048-sample cap. Single-channel. |
 | [psd.py](spectrum_engine/psd.py) | `coarse_psd_db`, `fine_welch_db`, `channel_psd`, `freq_axis_hz`. Cached Blackman/Hann/Hamming windows. |
 | [detectors.py](spectrum_engine/detectors.py) | `CoarseMeasurement`, `FineMeasurement` (now carries an optional `classifications` list), `DetectedRegion`, mean-based CA-CFAR (`cfar_threshold_1d`), region merging. |
 | [spectrum_grid.py](spectrum_engine/spectrum_grid.py) | `SpectrumCell` dataclass + `CellState` enum, `build_grid`, `map_measurement_to_cells`. |
@@ -95,12 +106,12 @@ Adaptive Hierarchical Multiband Spectrum Sensing Engine.
 | [telemetry.py](spectrum_engine/telemetry.py) | Append-only logs in `spectrum_logs/` (gitignored). |
 | [config.py](spectrum_engine/config.py) | YAML loader → `EngineConfig` dataclasses with embedded defaults. |
 
-### `spectrum_engine/sim/` — synthetic SDR + scene preview
-Drop-in replacement for the real SDR backend, plus the ground-truth preview synthesizer. **No pyadi-iio dependency** so the whole stack runs headless on macOS.
+### `spectrum_engine/sim/` — synthetic IQ source + scene preview
+Synthetic `IQSource` consumed by `SignalReader`, plus the ground-truth preview synthesizer. **No pyadi-iio dependency** so the whole stack runs headless on macOS.
 
 | Module | Role |
 |--------|------|
-| [sim/backend.py](spectrum_engine/sim/backend.py) | `SimulatedSDRBackend` — duck-typed `SDRBackend`. `capture()` builds IQ from the active `Scene`, frequency-shifts each emitter into the tuned window, adds noise + DC spike, reshapes for the engine. `set_scene()` swaps the scene live. |
+| [sim/iq_source.py](spectrum_engine/sim/iq_source.py) | `SimulatedIQSource` — `tune()` stores LO, `acquire()` builds IQ from the active `Scene` at raw ADC scale so `SignalReader` normalises both sources identically. Thread-safe `set_scene` for live GUI swaps. |
 | [sim/scene.py](spectrum_engine/sim/scene.py) | `Scene`, `Emitter`, `EmitterClass` dataclasses. |
 | [sim/synth.py](spectrum_engine/sim/synth.py) | `gen_awgn`, `gen_analog_fpv` (FM video with sync-tip AM dip so 15.625 kHz survives in the envelope-power FFT), `gen_barrage_jammer` (band-limited noise). |
 | [sim/scenarios.py](spectrum_engine/sim/scenarios.py) | Preset factories: `empty_band`, `fpv_at(hz)`, `jammer_at(hz)`, plus `GUI_PRESETS` driving the Scene combo. |
@@ -257,8 +268,9 @@ The Sim Preview panel is purely visual — no IQ, no detection, no algorithm run
 
 ## 10. Things to avoid
 
-- Don't change the destroy-buffer-then-retune-then-read order in `SDRBackend._read_natural` — pyadi-iio breaks silently if you reorder them (errno-0 stalls, zero scans).
-- Don't change `rx_buffer_size` inside `SDRBackend.capture()` — see the comment in [sdr_backend.py:131](spectrum_engine/sdr_backend.py:131); larger buffers change the sample layout and broke captures entirely in the past.
+- Don't change the destroy-buffer-then-set-`rx_lo` order in `PyAdiIQSource.tune` — pyadi-iio breaks silently if you reorder them (errno-0 stalls, zero scans). The reverse order has caused incidents in the past.
+- Don't change `rx_buffer_size` **at runtime**. It's set once at `PyAdiIQSource.__init__` based on cfg; per-capture resizing has broken libiio "interleaved sample layout" in the past. If the lifted default (`fft_size_base × max(fine_frames, coarse_frames)`) regresses on real hardware, pass `rx_buffer_size_override=2048` and document it.
+- Don't add normalisation, framing, or anti-alias logic inside an `IQSource`. That work belongs in `SignalReader.capture` so both sources share one rule book. Sources are raw-IQ-only.
 - Don't drop the DC-spike excision in `SpectrumEngine._process_capture` — PlutoSDR leaks LO into the centre FFT bin every capture, and removing the excision lights up every cell with a false centre signal. The simulator deliberately reproduces this spike.
 - Don't widen the scheduler's priority cadence beyond `_PRIORITY_EVERY = 4` — small priority-band revisit intervals (0.5 s) used to monopolise the scheduler and starve coverage.
 - Don't print to stdout from worker threads — use `error_occurred` signal or telemetry log.
