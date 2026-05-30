@@ -14,9 +14,33 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from enum import IntEnum
 from typing import List, Optional, TYPE_CHECKING
 
 import numpy as np
+
+
+class EngineStage(IntEnum):
+    """Four-stage operating ladder.
+
+    Strict superset: each stage runs everything from the stages below.
+    The GUI drives this via `SpectrumEngine.set_stage`.
+
+      * IDLE     — worker thread stopped; `step()` is never called.
+      * RECEIVE  — scheduler picks + tune + acquire raw IQ, then drop.
+                   No PSD, no display update, no cell-state work, no
+                   processor. Useful as a diagnostic that data is flowing.
+      * PROCESS  — RECEIVE + PSD compute + display buffer + per-cell
+                   baseline / occupancy / state machine + activity groups.
+                   Spectrum + waterfall come alive; no tracks, no
+                   classifications.
+      * CLASSIFY — PROCESS + `processor.process_fine` on fine scans +
+                   TrackManager updates. Full detection pipeline.
+    """
+    IDLE = 0
+    RECEIVE = 1
+    PROCESS = 2
+    CLASSIFY = 3
 
 from .config import EngineConfig, load_config
 from .spectrum_grid import (
@@ -145,11 +169,11 @@ class SpectrumEngine:
         # Runtime state
         self._backend: Optional[SignalReader] = None
         self._processor: SignalProcessor = default_processor()
-        # When False, _process_capture still computes PSD and updates the
-        # display buffer (so the spectrum/waterfall keep refreshing) but
-        # skips cell occupancy / group / fine / track work. The GUI
-        # Detect button flips this.
-        self.detect_enabled: bool = True
+        # Operating stage (see EngineStage docstring). Default CLASSIFY
+        # keeps existing callers (headless smoke scripts) running the full
+        # pipeline without opt-in. The GUI sets IDLE at construction and
+        # advances explicitly through the stage ladder.
+        self.stage: EngineStage = EngineStage.CLASSIFY
         self._scan_count: int = 0
         self._last_snapshot: Optional[EngineSnapshot] = None
         self._last_cmd: Optional[MeasurementCommand] = None
@@ -217,15 +241,20 @@ class SpectrumEngine:
     def get_processor(self) -> SignalProcessor:
         return self._processor
 
-    def set_detection_enabled(self, enabled: bool) -> None:
-        """Turn the detection pipeline on/off without stopping the engine.
+    def set_stage(self, stage: EngineStage) -> None:
+        """Switch operating stage. Safe to call live from the GUI thread.
 
-        When False, capture / PSD / display buffer updates still run, but
-        no cell occupancy updates, no group rebuild, no fine processor
-        call, no track maintenance. The spectrum and waterfall keep
-        moving so the operator can inspect the raw signal.
+        Each `step()` re-reads `self.stage`, so the change takes effect
+        at the next scan. The GUI is responsible for any state cleanup
+        that should happen on step-down transitions (drop tracks when
+        leaving CLASSIFY; reset cells when leaving PROCESS).
         """
-        self.detect_enabled = bool(enabled)
+        self.stage = EngineStage(int(stage))
+
+    # Back-compat alias used during the migration. New callers should
+    # call `set_stage(EngineStage.CLASSIFY | PROCESS)` directly.
+    def set_detection_enabled(self, enabled: bool) -> None:
+        self.stage = EngineStage.CLASSIFY if enabled else EngineStage.PROCESS
 
     def reset_detection_state(self) -> None:
         """Reset all cells to UNKNOWN, drop every track, clear groups.
@@ -363,12 +392,11 @@ class SpectrumEngine:
             med = float(np.median(psd_primary))
             psd_primary[max(0, mid - 1):mid + 2] = med
 
-        # When detection is disabled, skip cell occupancy / group / fine /
-        # track work. PSD and the display buffer still update so the GUI
-        # spectrum + waterfall keep moving — the operator can inspect the
-        # raw signal without algorithmic interpretation.
-        if not self.detect_enabled:
-            self._update_display_buffer(psd_primary, f_ax)
+        # Stage RECEIVE: tune + acquire already happened upstream
+        # (scheduler picked, backend captured). We drop IQ here — no PSD,
+        # no display update, no cell state, no processor. Use case is the
+        # "raw signal is flowing" diagnostic at the bottom of the ladder.
+        if self.stage <= EngineStage.RECEIVE:
             self._scan_count += 1
             snapshot = self._make_snapshot(capture_time, groups)
             self._last_snapshot = snapshot
@@ -437,6 +465,16 @@ class SpectrumEngine:
             now=capture_time,
         )
 
+        # Stage PROCESS: PSD + display + cell-state machine ran above;
+        # we stop short of the processor and TrackManager.
+        if self.stage <= EngineStage.PROCESS:
+            self._update_display_buffer(psd_primary, f_ax)
+            self._scan_count += 1
+            snapshot = self._make_snapshot(capture_time, groups)
+            self._last_snapshot = snapshot
+            return snapshot
+
+        # Stage CLASSIFY: full pipeline.
         # --- 7. Fine detection → region → track update ---
         if cmd.is_fine:
             # Dispatch through the pluggable processor. The default
