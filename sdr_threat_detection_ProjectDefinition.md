@@ -155,25 +155,37 @@ Embeddable alert package — no SDR dependency, safe to import standalone.
 ### Mac — simulator only (no hardware required)
 
 ```bash
+# one-time setup
 python3 -m venv .venv && source .venv/bin/activate
 pip install numpy pyqtgraph PyQt5 pyyaml
-python drone_detector_enhanced.py
+deactivate            # optional — run.sh doesn't need an active venv
+
+# every run
+./run.sh
 ```
 
-`pyadi-iio` is intentionally skipped — `libiio` is awkward on macOS and the simulator does not need it. In the GUI: **Src** → `Simulator`, pick a **Scene**, click **Simulate**, then click **Detect: OFF** to flip it ON when you're ready to run detection.
+`pyadi-iio` is intentionally skipped — `libiio` is awkward on macOS and the simulator does not need it. In the GUI: **Src** → `Simulator`, pick a **Scene**, click up the stage ladder: **Receive** → **Process** → **Classify**.
 
 ### Linux — real Pluto (full hardware path)
 
 ```bash
+# one-time setup
 sudo apt install -y libiio0 libiio-utils python3-libiio
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 pip install pyyaml             # YAML config support
 pip install numba              # optional CFAR JIT
-python drone_detector_enhanced.py
+deactivate
+
+# every run
+./run.sh
 ```
 
-In the GUI: **Src** → `Hardware`, click **Receiver On**. (See troubleshooting in [README.md](README.md) §Requirements for udev rules etc.)
+In the GUI: **Src** → `Hardware`, click **Receive** (or any stage up to Classify). (See troubleshooting in [README.md](README.md) §Requirements for udev rules etc.)
+
+### About `run.sh`
+
+The launcher (`run.sh` at the repo root) calls `.venv/bin/python` directly so you don't need to `source .venv/bin/activate` every shell session. It also `cd`s into the repo so `engine_config.yaml` and `spectrum_logs/` resolve correctly regardless of where you invoke it from. If `.venv/bin/python` is missing, the script prints the one-time setup steps and exits.
 
 ### Headless / scripted (no Qt)
 
