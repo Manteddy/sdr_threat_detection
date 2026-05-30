@@ -28,18 +28,17 @@ Simulator ─► Simulated     │   (one capture fn)    │  ──────
                                                    └────────┬────────────────┘
             ┌───────────────────────────────────────────────┘
             │
-            │   SpectrumEngine.step()
+            │   SpectrumEngine.step()                  (stage-gated)
             │   ├─ Scheduler picks MeasurementCommand
-            │   ├─ reader.capture() ─► IQCapture
-            │   │     (tune → settle → acquire → normalise →
-            │   │      anti-alias → frame → single-antenna mirror)
-            │   ├─ channel_psd()    ─► PSD
-            │   ├─ if detect_enabled:
-            │   │     update cells / groups / tracks
-            │   │     processor.process_fine() ─► FineMeasurement
-            │   │                                  ├─ DetectedRegion[]
-            │   │                                  └─ ClassificationResult[]
-            │   └─ update display buffer + emit EngineSnapshot
+            │   ├─ reader.capture() ─► IQCapture                  ┐
+            │   │     (tune → settle → acquire → normalise →     │ RECEIVE
+            │   │      anti-alias → frame → single-antenna mirror)│ and up
+            │   ├─ channel_psd() + cells + groups + display buffer ┐ PROCESS
+            │   │                                                  │ and up
+            │   ├─ processor.process_fine() ─► FineMeasurement     ┐ CLASSIFY
+            │   │     ├─ DetectedRegion[]                          │ only
+            │   │     └─ ClassificationResult[]                    │
+            │   └─ emit EngineSnapshot
             │
             ▼
    Qt main thread (drone_detector_enhanced.py)
@@ -54,6 +53,17 @@ the same code path for hardware and simulator — `IQSource`s do raw IQ
 acquisition only; everything else (normalisation to dBFS, anti-alias,
 framing, dual-mirror, dwell budget) lives in the reader. That is the
 contract that makes "signal is signal" hold.
+
+`EngineStage` is the **single knob** that controls how deep `step()` goes:
+
+| Stage | Engine does | Use |
+|------|-------------|-----|
+| `IDLE` | nothing (worker stopped) | Engine off. |
+| `RECEIVE` | scheduler + tune + acquire → drop IQ | Diagnostic: confirm data is flowing. |
+| `PROCESS` | + PSD + display buffer + cell state | Spectrum + waterfall live, no classification. |
+| `CLASSIFY` | + processor.process_fine + TrackManager | Full detection pipeline (today's default). |
+
+Strict superset: each stage runs everything from the stages below it.
 
 Three orthogonal axes the GUI exposes:
 
@@ -84,7 +94,8 @@ The receiver path is unchanged across simulator vs hardware. The only thing that
 | [signal_processing_selector_plan.md](signal_processing_selector_plan.md) | Plug-in architecture for swappable signal processors. |
 | [signal_processing_integration_plan.md](signal_processing_integration_plan.md) | OS-CFAR + classifier processor on top of the plug-in foundation. |
 | [sdr_simulator_plan.md](sdr_simulator_plan.md) | Synthetic SDR backend design (now implemented; doc still useful for context). |
-| [signal_reader_refactor_plan.md](signal_reader_refactor_plan.md) | One-`capture()` architecture across hardware + simulator (this refactor). |
+| [signal_reader_refactor_plan.md](signal_reader_refactor_plan.md) | One-`capture()` architecture across hardware + simulator. |
+| [gui_stage_ladder_plan.md](gui_stage_ladder_plan.md) | 4-stage operating ladder (Idle / Receive / Process / Classify) + segmented control replacing Connect + Detect. |
 
 ### `spectrum_engine/`
 Adaptive Hierarchical Multiband Spectrum Sensing Engine.
@@ -251,11 +262,12 @@ Top bar (left → right) in [drone_detector_enhanced.py](drone_detector_enhanced
 
 | Control | What it does |
 |---------|--------------|
-| `Src:` Hardware / Simulator | Picks the IQ source. Hardware uses pyadi-iio; Simulator uses `SimulatedSDRBackend`. |
-| `Scene:` preset combo | Active only in Simulator mode. Presets: Empty band, FPV @ 1.3 / 2.4 / 3.7 / 5.8 / 6.2 GHz, Jammer @ 2.45 GHz. Live-swap supported via `SimulatedSDRBackend.set_scene`. |
+| `Src:` Hardware / Simulator | Picks the IQ source. Hardware uses `PyAdiIQSource` over pyadi-iio; Simulator uses `SimulatedIQSource`. Both feed `SignalReader`. Changing source while a session is running snaps the stage back to Idle. |
+| `Scene:` preset combo | Active only in Simulator mode. Presets: Empty band, FPV @ 1.3 / 2.4 / 3.7 / 5.8 / 6.2 GHz, Jammer @ 2.45 GHz. Live-swap supported via `SimulatedIQSource.set_scene`. |
 | `Proc:` Classic / OS-CFAR | Picks the `SignalProcessor`. Runtime swap via `SpectrumEngine.set_processor`. |
-| **Simulate / Stop simulation** (Simulator) / **Receiver On / Receiver Off** (Hardware) | Contextual primary button. Green when off, red when on. |
-| **Detect: OFF / ON** | Detection toggle. **Default OFF** on launch — the operator inspects raw signal first, then opts in. Going from ON → OFF clears every cell back to `UNKNOWN` and drops every track. |
+| **Stage ladder** `[Idle] [Receive] [Process] [Classify]` | Four-segment exclusive control. The selected stage + every stage to its left is filled with its colour (gray / cyan / green / orange). One click advances or retreats. Default on launch: **Idle**. See [§7 Stage ladder](#7-detection-algorithms-plug-ins) and [gui_stage_ladder_plan.md](gui_stage_ladder_plan.md). |
+
+The stage ladder is owned by `EngineStage` (see §2). The same segmented control replaces the previous Connect button (Idle ↔ active transitions own connection) and the Detect toggle (Process ↔ Classify owns detection). One control instead of two; no hidden state.
 
 Main display:
 
@@ -271,6 +283,8 @@ The Sim Preview panel is purely visual — no IQ, no detection, no algorithm run
 - Don't change the destroy-buffer-then-set-`rx_lo` order in `PyAdiIQSource.tune` — pyadi-iio breaks silently if you reorder them (errno-0 stalls, zero scans). The reverse order has caused incidents in the past.
 - Don't change `rx_buffer_size` **at runtime**. It's set once at `PyAdiIQSource.__init__` based on cfg; per-capture resizing has broken libiio "interleaved sample layout" in the past. If the lifted default (`fft_size_base × max(fine_frames, coarse_frames)`) regresses on real hardware, pass `rx_buffer_size_override=2048` and document it.
 - Don't add normalisation, framing, or anti-alias logic inside an `IQSource`. That work belongs in `SignalReader.capture` so both sources share one rule book. Sources are raw-IQ-only.
+- Don't bypass `EngineStage` to "just do detection". Walk the ladder: cells must already exist (PROCESS) before tracks (CLASSIFY) make sense. Going down a stage triggers the right cleanup (drop tracks at Classify→Process; reset cells at Process→Receive) — preserve that contract.
+- Don't reintroduce a `detect_enabled` bool. The 4-stage ladder replaces it. `set_detection_enabled` survives as a thin alias mapping `{True: CLASSIFY, False: PROCESS}` for back-compat smoke scripts; new code uses `set_stage` directly.
 - Don't drop the DC-spike excision in `SpectrumEngine._process_capture` — PlutoSDR leaks LO into the centre FFT bin every capture, and removing the excision lights up every cell with a false centre signal. The simulator deliberately reproduces this spike.
 - Don't widen the scheduler's priority cadence beyond `_PRIORITY_EVERY = 4` — small priority-band revisit intervals (0.5 s) used to monopolise the scheduler and starve coverage.
 - Don't print to stdout from worker threads — use `error_occurred` signal or telemetry log.

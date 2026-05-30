@@ -25,5 +25,5 @@ free so the doc can be shared / linked / read by non-Claude tools):
 - Simulator source + scene preview: `spectrum_engine/sim/`
 - Processors: `signal_pipeline/` (registry + Classic + OSCFAR)
 - Engine: `spectrum_engine/engine.py` (owns processor, detect_enabled, reset_detection_state)
-- GUI: `drone_detector_enhanced.py` (Src / Scene / Proc / Detect controls + Sim Preview panel)
-- Plans: `signal_processing_selector_plan.md`, `signal_processing_integration_plan.md`, `sdr_simulator_plan.md`, `signal_reader_refactor_plan.md`
+- GUI: `drone_detector_enhanced.py` (Src / Scene / Proc combos + 4-stage Idle/Receive/Process/Classify ladder + Sim Preview panel)
+- Plans: `signal_processing_selector_plan.md`, `signal_processing_integration_plan.md`, `sdr_simulator_plan.md`, `signal_reader_refactor_plan.md`, `gui_stage_ladder_plan.md`
