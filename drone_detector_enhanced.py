@@ -700,9 +700,13 @@ class DroneDetector(QMainWindow):
         self._sim_preview_wf = deque(maxlen=DEFAULT_WF_LINES)
         self._sim_preview_rng = np.random.default_rng(42)
         self._sim_preview_active = False
-        # Detect flag mirrors engine.detect_enabled — default OFF
-        # so the operator can inspect the raw signal first and opt in.
-        self._detect_enabled = False
+        # Stage ladder (see EngineStage). The GUI walks Idle → Receive →
+        # Process → Classify via the segmented control. _set_stage drives
+        # the engine + worker; this attribute is the GUI's mirror.
+        # Assigned again in _setup_ui after the buttons exist, but the
+        # default needs to be defined here so _on_source_changed etc. are
+        # safe to call before the UI is built.
+        self._stage = None  # filled in by _setup_ui
         # ------------------------------------------------------------
 
         self._setup_ui()
@@ -1501,21 +1505,14 @@ class DroneDetector(QMainWindow):
         self._alert_window.show()
 
     # -------------------------------------------------------- Connection
-    def try_connect(self):
-        """Dispatch to hardware or simulator path based on the Source combo."""
-        source = self.source_combo.currentText() if hasattr(self, "source_combo") else "Hardware"
-        if source == "Simulator":
-            self._connect_simulator()
-        else:
-            self._connect_hardware()
-
-    def _connect_hardware(self):
+    def _connect_hardware(self, target_stage=None):
+        target_stage = target_stage if target_stage is not None else EngineStage.CLASSIFY
         try:
             import adi
         except (ImportError, TypeError, OSError):
             self.status_label.setText("Error: pip install pyadi-iio (needs libiio)")
             self.status_label.setStyleSheet("color:#f44;")
-            return
+            return False
 
         try:
             if self.sdr:
@@ -1642,9 +1639,6 @@ class DroneDetector(QMainWindow):
                 f"{self.sweep_end_hz/1e9:.3f} GHz ({self.num_steps} steps)"
             )
             self.status_label.setStyleSheet("color:#0f0;")
-            self.connect_btn.clicked.disconnect()
-            self.connect_btn.clicked.connect(self._disconnect)
-            self._refresh_primary_button_label()
 
             self._reset_buffers()
             self.sweep_worker.configure(
@@ -1668,11 +1662,8 @@ class DroneDetector(QMainWindow):
                         eng_cfg,
                     )
                     self._engine.attach_backend(self._engine_backend)
-                    # Apply the GUI's currently-selected signal processor.
                     self._apply_selected_processor()
-                    # Push current Detect button state onto the engine.
-                    self._apply_detection_state()
-                    # Honour the currently-selected sweep window
+                    self._engine.set_stage(target_stage)
                     self._engine.set_active_range(self.sweep_start_hz, self.sweep_end_hz)
                     self.sweep_worker.configure_engine(self._engine, self._engine_backend)
                     if self.engine_status_label:
@@ -1694,11 +1685,13 @@ class DroneDetector(QMainWindow):
 
             self.sweep_worker.start()
             self.update_timer.start(80)
+            return True
 
         except Exception as e:
             self.connected = False
             self.status_label.setText(f"Connection failed: {str(e)[:60]}")
             self.status_label.setStyleSheet("color:#f44;")
+            return False
 
     def _disconnect(self):
         self.sweep_worker.stop()
@@ -1720,9 +1713,6 @@ class DroneDetector(QMainWindow):
                 pass
             self.sdr = None
         self.connected = False
-        self.connect_btn.clicked.disconnect()
-        self.connect_btn.clicked.connect(self.try_connect)
-        self._refresh_primary_button_label()
         self.status_label.setText("Disconnected")
         self.status_label.setStyleSheet("color:#888;")
         self.warning_label.setText("")
@@ -1737,12 +1727,13 @@ class DroneDetector(QMainWindow):
         self.alert_panel.clear()
 
     # ------------------------------------------------------------ Simulator
-    def _connect_simulator(self):
+    def _connect_simulator(self, target_stage=None):
         """Spin up the engine against a simulated IQ source instead of pyadi-iio."""
+        target_stage = target_stage if target_stage is not None else EngineStage.CLASSIFY
         if not (HAS_SIM and HAS_ENGINE):
             self.status_label.setText("Simulator unavailable (needs spectrum_engine + sim)")
             self.status_label.setStyleSheet("color:#f44;")
-            return
+            return False
 
         try:
             eng_cfg = _load_engine_config()
@@ -1761,9 +1752,6 @@ class DroneDetector(QMainWindow):
                 f"({self.num_steps} steps)"
             )
             self.status_label.setStyleSheet("color:#0ff;")
-            self.connect_btn.clicked.disconnect()
-            self.connect_btn.clicked.connect(self._disconnect)
-            self._refresh_primary_button_label()
 
             self._reset_buffers()
             # Worker still needs configure() so its display buffers / features
@@ -1787,7 +1775,7 @@ class DroneDetector(QMainWindow):
             )
             self._engine.attach_backend(self._engine_backend)
             self._apply_selected_processor()
-            self._apply_detection_state()
+            self._engine.set_stage(target_stage)
             self._engine.set_active_range(self.sweep_start_hz, self.sweep_end_hz)
             self.sweep_worker.configure_engine(self._engine, self._engine_backend)
 
@@ -1800,14 +1788,21 @@ class DroneDetector(QMainWindow):
 
             self.sweep_worker.start()
             self.update_timer.start(80)
+            return True
 
         except Exception as e:
             self.connected = False
             self.status_label.setText(f"Sim connect failed: {str(e)[:60]}")
             self.status_label.setStyleSheet("color:#f44;")
+            return False
 
     def _on_source_changed(self, _idx):
-        """Enable scene combo + start/stop the sim preview based on source."""
+        """Enable scene combo + start/stop the sim preview based on source.
+
+        Changing source while a session is active forces a step down to
+        Idle — connection is owned by the stage ladder, so the operator
+        re-engages by clicking back up to Receive/Process/Classify.
+        """
         if self.scene_combo is None:
             return
         is_sim = self.source_combo.currentText() == "Simulator"
@@ -1816,7 +1811,8 @@ class DroneDetector(QMainWindow):
             self._activate_sim_preview()
         else:
             self._deactivate_sim_preview()
-        self._refresh_primary_button_label()
+        if self._stage is not None and self._stage != EngineStage.IDLE:
+            self._set_stage(EngineStage.IDLE)
 
     def _on_scene_changed(self, _idx):
         """Live-swap the simulator's scene and refresh the preview panel."""
@@ -1864,71 +1860,62 @@ class DroneDetector(QMainWindow):
         except KeyError:
             return  # unknown name → leave the previous processor in place
 
-    # ------------------------------------------------------------ Detect / Connect button helpers
-    def _refresh_primary_button_label(self):
-        """Set Connect-button text + style based on Source + connected state."""
-        if not hasattr(self, "connect_btn"):
-            return
-        src = self.source_combo.currentText() if hasattr(self, "source_combo") else "Hardware"
-        start_style = (
-            "QPushButton{background:#1e4d2b;color:#9fff9f;border:1px solid #2f7a44;"
-            "padding:5px;font-weight:bold;}"
-            "QPushButton:hover{background:#2a6b3b;}"
-        )
-        stop_style = (
-            "QPushButton{background:#4d1e1e;color:#ff9f9f;border:1px solid #7a2f2f;"
-            "padding:5px;font-weight:bold;}"
-            "QPushButton:hover{background:#6b2a2a;}"
-        )
-        if self.connected:
-            label = "Stop simulation" if src == "Simulator" else "Receiver Off"
-            self.connect_btn.setStyleSheet(stop_style)
-        else:
-            label = "Simulate" if src == "Simulator" else "Receiver On"
-            self.connect_btn.setStyleSheet(start_style)
-        self.connect_btn.setText(label)
-
-    def _refresh_detect_button_label(self):
-        """Set Detect toggle text + style based on current state."""
-        if not hasattr(self, "detect_btn"):
-            return
-        if self._detect_enabled:
-            self.detect_btn.setText("Detect: ON")
-            self.detect_btn.setStyleSheet(
-                "QPushButton{background:#5a3b00;color:#ffcc66;border:1px solid #885a00;"
-                "padding:5px;font-weight:bold;}"
-                "QPushButton:hover{background:#7a4f00;}"
-            )
-        else:
-            self.detect_btn.setText("Detect: OFF")
-            self.detect_btn.setStyleSheet(
-                "QPushButton{background:#2a2a4a;color:#888;border:1px solid #444;"
-                "padding:5px;}"
-                "QPushButton:hover{background:#3a3a5a;color:#aaa;}"
-            )
-
-    def _on_detect_toggled(self, checked):
-        """Toggle detection. Going OFF resets all cells + drops tracks."""
-        was_on = self._detect_enabled
-        self._detect_enabled = bool(checked)
-        if self._engine is not None:
-            self._engine.set_detection_enabled(self._detect_enabled)
-            if was_on and not self._detect_enabled:
-                self._engine.reset_detection_state()
-        self._refresh_detect_button_label()
-
-    def _apply_detection_state(self):
-        """Push current detect flag onto the engine (called at connect time)."""
-        if self._engine is None:
-            return
-        self._engine.set_detection_enabled(self._detect_enabled)
-
     # ------------------------------------------------------------ Stage ladder
     def _on_stage_clicked(self, stage):
-        """Stub for Phase B — Phase C replaces this with full transitions."""
-        if stage == self._stage:
+        """Segmented control callback → drive the stage transition."""
+        self._set_stage(stage)
+
+    def _set_stage(self, target_stage):
+        """Drive the engine + worker through a stage transition.
+
+        Same-stage clicks are no-ops. Idle → active starts the source.
+        Active → Idle stops the worker and tears down the engine. Going
+        down between active stages cleans up the state that was being
+        produced at the higher stage (tracks for Classify, cell state
+        for Process) per the rule in the plan.
+        """
+        if self._stage is None:
+            # First-time init from _setup_ui.
+            self._stage = target_stage
+            self._refresh_stage_buttons()
             return
-        self._stage = stage
+        if target_stage == self._stage:
+            return
+
+        old_stage = self._stage
+
+        # Idle → active: connect via the selected source.
+        if old_stage == EngineStage.IDLE and target_stage > EngineStage.IDLE:
+            src = (self.source_combo.currentText()
+                   if hasattr(self, "source_combo") else "Hardware")
+            ok = (self._connect_simulator(target_stage)
+                  if src == "Simulator" else self._connect_hardware(target_stage))
+            if not ok:
+                self._stage = EngineStage.IDLE
+                self._refresh_stage_buttons()
+                return
+            self._stage = target_stage
+            self._refresh_stage_buttons()
+            return
+
+        # Active → Idle: full teardown.
+        if old_stage > EngineStage.IDLE and target_stage == EngineStage.IDLE:
+            self._disconnect()
+            self._stage = EngineStage.IDLE
+            self._refresh_stage_buttons()
+            return
+
+        # Active → active: keep connection, just flip engine.stage.
+        # Going down cleans up state we are no longer producing.
+        if target_stage < old_stage and self._engine is not None:
+            if target_stage < EngineStage.CLASSIFY <= old_stage:
+                self._engine.track_mgr.clear_all()
+            if target_stage < EngineStage.PROCESS <= old_stage:
+                self._engine.reset_detection_state()
+
+        if self._engine is not None:
+            self._engine.set_stage(target_stage)
+        self._stage = target_stage
         self._refresh_stage_buttons()
 
     def _refresh_stage_buttons(self):
