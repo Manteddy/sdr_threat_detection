@@ -1,47 +1,28 @@
 """
 SDR Backend abstraction for the Adaptive Spectrum Sensing Engine.
 
-Wraps a pyadi-iio object (AD9361 / PlutoSDR) and exposes a clean
-capture() interface used by both coarse and fine measurement paths.
+DEPRECATED: this module is being retired in favour of `iq_source.py`
+(`IQSource` ABC + dataclasses) and `signal_reader.py` (the single
+`SignalReader.capture()` shared by hardware and simulator). The
+`SDRBackend` class below stays alongside during the migration window
+so existing callers keep working. New code should use:
 
-The tune/capture/IQ-extraction logic is refactored from
-SweepWorker._do_one_step() in drone_detector_enhanced.py.
+  from spectrum_engine import SignalReader
+  from spectrum_engine.sources.pyadi import PyAdiIQSource
+  reader = SignalReader(PyAdiIQSource(sdr_obj, cfg), cfg)
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import numpy as np
 
 from .config import EngineConfig, HardwareCfg
-
-
-# ---------------------------------------------------------------------------
-# Data containers
-# ---------------------------------------------------------------------------
-
-@dataclass
-class HardwareLimits:
-    """Reported capabilities of the connected SDR."""
-    min_hz: float
-    max_hz: float
-    bandwidth_hz: float
-    sample_rate_hz: float
-    dual_channel: bool
-
-
-@dataclass
-class IQCapture:
-    """Raw IQ sample block returned by a single capture call."""
-    center_hz: float
-    bandwidth_hz: float
-    timestamp: float
-    # Shape: (num_frames, fft_size) or (fft_size,) when num_frames==1
-    omni_iq: np.ndarray    # complex64
-    dir_iq: np.ndarray     # complex64 — mirrors omni when single-channel
+# Re-export the dataclasses from their new canonical home so existing
+# `from spectrum_engine.sdr_backend import IQCapture` imports keep working.
+from .iq_source import HardwareLimits, IQCapture  # noqa: F401
 
 
 # ---------------------------------------------------------------------------
