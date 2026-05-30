@@ -412,6 +412,13 @@ class SpectrumEngine:
                 cfg.coarse_scan.fft_size,
             )
             self._update_display_buffer(raw_psd, raw_f_ax)
+            # Tell the scheduler this window was visited so it advances
+            # to the next cell instead of re-scanning the same one forever.
+            # Occupancy / baseline / state are intentionally NOT updated.
+            for cell in map_measurement_to_cells(
+                cmd.center_hz, cmd.bandwidth_hz, self.cells
+            ):
+                cell.last_scan_time = capture_time
             self._scan_count += 1
             snapshot = self._make_snapshot(capture_time, groups)
             self._last_snapshot = snapshot
