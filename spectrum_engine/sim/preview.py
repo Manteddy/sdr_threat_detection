@@ -42,9 +42,14 @@ def scene_psd_db(
         rng = np.random.default_rng()
 
     freqs = np.linspace(start_hz, stop_hz, n_bins, dtype=np.float64)
-    # Linear power baseline = noise floor + jitter.
     noise_floor_dbfs = float(scene.noise_floor_dbfs)
-    jitter = rng.standard_normal(n_bins).astype(np.float32) * noise_jitter_db
+    # Small jitter so the noise floor looks alive on refresh, but clipped
+    # to ±noise_jitter_db so individual bins never spike far above the
+    # floor and create false visual peaks in the empty-band region.
+    jitter = np.clip(
+        rng.standard_normal(n_bins).astype(np.float32) * noise_jitter_db,
+        -noise_jitter_db, noise_jitter_db,
+    )
     psd_db = np.full(n_bins, noise_floor_dbfs, dtype=np.float32) + jitter
 
     for em in scene.emitters:
