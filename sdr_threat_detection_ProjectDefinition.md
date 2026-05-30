@@ -1,39 +1,61 @@
 # sdr_threat_detection — Project Definition
 
-Project-level guide for engineers and AI agents (Claude / Cursor / etc.) working in this repo. Read this before touching code or generating large patches.
+Project-level guide for engineers and AI agents (Claude / Cursor / etc.) working in this repo. Read this before touching code or generating large patches. See [§11](#11-how-this-document-stays-current) for the rules that keep this doc in sync with the codebase.
 
 ---
 
 ## 1. What this project is
 
-`sdr_threat_detection` (a.k.a. `pluto_drone_detector`) is an SDR-based anti-drone detection system. It uses a PlutoSDR / AD9361 to listen for the wideband analog video transmissions used by FPV strike and reconnaissance drones in the 5.8 GHz ISM band (and other priority bands at 1.2 / 2.4 GHz). Output is a live spectrum + waterfall UI plus a separate proximity alert window that can also be exposed over WebSocket.
+`sdr_threat_detection` (a.k.a. `pluto_drone_detector`) is an SDR-based anti-drone detection system. It uses a PlutoSDR / AD9361 to listen for the wideband analog video transmissions used by FPV strike and reconnaissance drones across **1.0 - 6.5 GHz**, with priority on the 1.2 / 2.4 / 5.8 GHz bands. Output is a live spectrum + waterfall UI, a ground-truth simulator preview, and a separate proximity alert window that can also be exposed over WebSocket.
 
-It implements **steps 3-4** of the broader pipeline documented in [product_pipeline.md](product_pipeline.md) (SDR acquisition + signal processing). Upstream RF capture (steps 1-2) and downstream Starlink relay / mission-control overlay (steps 5-10) are out of scope for this repo.
+It implements **steps 3-4** of the broader pipeline documented in [product_pipeline.md](product_pipeline.md) (SDR acquisition + signal processing). Upstream RF capture (steps 1-2) and downstream Starlink relay / mission-control overlay (steps 5-10) are out of scope.
+
+Operationally there are **two data sources** (hardware or simulator) and **two detection algorithms** (Classic CA-CFAR or OS-CFAR + classifier), all switchable at runtime from the GUI — see §9.
 
 ---
 
 ## 2. High-level architecture
 
 ```
-PlutoSDR  ──►  SDRBackend.capture()  ──►  PSD (coarse FFT / fine Welch)
-   │                  │
-   │             SpectrumEngine.step()  ◄── Scheduler picks MeasurementCommand
-   │                  │
-   │           cells / groups / tracks                          (state)
-   │                  │
-   │           EngineSnapshot  ──►  Qt UI thread  ──►  spectrum + waterfall
-   │                                       │
-   │                                       └──►  AlertEngine  ──►  ProximityAlertPanel / WS
-   │
-   └─►  (legacy) SweepWorker fixed-step loop ──►  spectrum_omni/_dir buffers
+            ┌────────────────────────────┐         ┌─────────────────────────┐
+Hardware ──►│  spectrum_engine/          │         │  signal_pipeline/       │
+ (Pluto)    │  sdr_backend.SDRBackend    │         │  (plug-in processors)   │
+            │                            │         │  ──────────────────────  │
+Simulator ─►│  spectrum_engine/sim/      │         │  base.SignalProcessor   │
+ (Mac/CI)   │  sim.SimulatedSDRBackend   │         │  classic.ClassicProc    │
+            └────────────┬───────────────┘         │  oscfar.OSCFARProc      │
+                         │ IQCapture                │  registry.get/list      │
+                         ▼                          └────────┬────────────────┘
+            ┌────────────────────────────────────────────────┘
+            │
+            │   SpectrumEngine.step()
+            │   ├─ Scheduler picks MeasurementCommand
+            │   ├─ backend.capture() ─► IQCapture
+            │   ├─ channel_psd()     ─► PSD
+            │   ├─ if detect_enabled:
+            │   │     update cells / groups / tracks
+            │   │     processor.process_fine() ─► FineMeasurement
+            │   │                                  ├─ DetectedRegion[]
+            │   │                                  └─ ClassificationResult[]
+            │   └─ update display buffer + emit EngineSnapshot
+            │
+            ▼
+   Qt main thread (drone_detector_enhanced.py)
+      ├─ Spectrum + waterfall (RX1) — live receiver view
+      ├─ Sim Preview panel — analytical ground-truth scene PSD (1-6.5 GHz)
+      ├─ AlertEngine ─► ProximityAlertPanel / WebSocket
+      └─ Top-bar controls: Src / Scene / Proc / Connect / Detect
 ```
 
-Two coexisting processing paths:
+Three orthogonal axes the GUI exposes:
 
-1. **Adaptive engine path** (preferred, `spectrum_engine/`) — coarse-to-fine, CA-CFAR, scheduled revisits, track manager.
-2. **Classic sweep path** (legacy, embedded in `drone_detector*.py`) — fixed-step LO sweep, single FFT, hybrid CFAR-or-fixed detection, used as backward-compatible fallback when the engine cannot attach.
+| Axis | Choices | Mechanism |
+|------|---------|-----------|
+| Source of IQ | Hardware ↔ Simulator | `SimulatedSDRBackend` is duck-typed to `SDRBackend` |
+| Detection algorithm | Classic CA-CFAR ↔ OS-CFAR + Classifier | `signal_pipeline` registry + `SpectrumEngine.set_processor` |
+| Detection on/off | Detect OFF ↔ ON | `SpectrumEngine.detect_enabled` flag |
 
-The enhanced GUI in [drone_detector_enhanced.py](drone_detector_enhanced.py) drives whichever path is active and emits results to the same Qt widgets and to `proximity_alert`.
+The receiver path is unchanged across simulator vs hardware. The only thing that differs is which `*Backend` is wired in.
 
 ---
 
@@ -43,57 +65,111 @@ The enhanced GUI in [drone_detector_enhanced.py](drone_detector_enhanced.py) dri
 | Path | Role |
 |------|------|
 | [drone_detector.py](drone_detector.py) | Minimal version: single FFT + fixed threshold + fast sweep. Reference implementation, no engine. |
-| [drone_detector_enhanced.py](drone_detector_enhanced.py) | Production GUI. Hosts `SweepWorker` (Qt thread) which runs either the adaptive engine loop or a classic sweep, plus `DistanceEstimator`, `FastlockManager`, hybrid detection. |
+| [drone_detector_enhanced.py](drone_detector_enhanced.py) | Production GUI. Hosts `SweepWorker` (Qt thread), the Src/Scene/Proc/Detect controls, the RX1 spectrum + waterfall, and the new Sim Preview panel. |
 | [engine_config.yaml](engine_config.yaml) | Runtime knobs for `SpectrumEngine`: frequency range, hardware bandwidth, coarse/fine FFT, CFAR, scheduler, state thresholds, priority bands. |
-| [requirements.txt](requirements.txt) | `pyadi-iio`, `numpy`, `pyqtgraph`, `PyQt5`. Optional: `numba`, `websockets`, `pyyaml`. |
+| [requirements.txt](requirements.txt) | `pyadi-iio` (hardware-only), `numpy`, `pyqtgraph`, `PyQt5`. Optional: `numba`, `websockets`, `pyyaml`. |
 | [README.md](README.md) | Operator-facing usage and feature summary. |
 | [short_overview.md](short_overview.md) | Non-technical pitch. |
 | [ADVANCED_FEATURES.md](ADVANCED_FEATURES.md) | Concept guide for Welch PSD / CA-CFAR / Kalman distance / hysteresis. |
 | [signal_pipeline.md](signal_pipeline.md) | Long-form (~49 KB) walk-through of the **classic** RF → display pipeline. |
 | [product_pipeline.md](product_pipeline.md) | End-to-end air → Starlink → goggles diagram. |
+| [signal_processing_selector_plan.md](signal_processing_selector_plan.md) | Plug-in architecture for swappable signal processors. |
+| [signal_processing_integration_plan.md](signal_processing_integration_plan.md) | OS-CFAR + classifier processor on top of the plug-in foundation. |
+| [sdr_simulator_plan.md](sdr_simulator_plan.md) | Synthetic SDR backend design (now implemented; doc still useful for context). |
 
 ### `spectrum_engine/`
-Adaptive Hierarchical Multiband Spectrum Sensing Engine. Phases 1-3 are implemented.
+Adaptive Hierarchical Multiband Spectrum Sensing Engine.
 
 | Module | Role |
 |--------|------|
-| [engine.py](spectrum_engine/engine.py) | `SpectrumEngine.step()` orchestrates one measurement cycle. Owns cells, nodes, scheduler, track manager, telemetry. Returns `EngineSnapshot`. |
-| [sdr_backend.py](spectrum_engine/sdr_backend.py) | `SDRBackend.capture(center_hz, bandwidth_hz, dwell_s, num_frames) -> IQCapture`. Single `rx()` per scan, paranoid about pyadi-iio buffer ordering. |
+| [engine.py](spectrum_engine/engine.py) | `SpectrumEngine.step()` orchestrates one measurement cycle. Owns cells, scheduler, tracks, telemetry, the active `SignalProcessor`, and the `detect_enabled` flag. Public hooks: `attach_backend`, `set_processor`, `set_detection_enabled`, `reset_detection_state`. Returns `EngineSnapshot`. |
+| [sdr_backend.py](spectrum_engine/sdr_backend.py) | `SDRBackend.capture(...) -> IQCapture` over pyadi-iio. Single `rx()` per scan, paranoid about libiio buffer ordering. |
 | [psd.py](spectrum_engine/psd.py) | `coarse_psd_db`, `fine_welch_db`, `channel_psd`, `freq_axis_hz`. Cached Blackman/Hann/Hamming windows. |
-| [detectors.py](spectrum_engine/detectors.py) | `CoarseMeasurement`, `FineMeasurement`, `DetectedRegion`, **CA-CFAR** (`cfar_threshold_1d`), region merging, confidence scoring. |
-| [spectrum_grid.py](spectrum_engine/spectrum_grid.py) | `SpectrumCell` dataclass + `CellState` enum (UNKNOWN/QUIET/SUSPECT/ACTIVE/TRACKED/STALE/UNSUPPORTED), `build_grid`, `map_measurement_to_cells`. |
-| [scheduler.py](spectrum_engine/scheduler.py) | `Scheduler.choose_next_measurement` interleaves coverage scans (round-robin by staleness) with priority work (track revisits, group fine scans, priority bands). |
-| [tracks.py](spectrum_engine/tracks.py) | `SignalTrack` lifecycle CANDIDATE → CONFIRMED → TRACKING → LOST → EXPIRED via `TrackManager`. |
+| [detectors.py](spectrum_engine/detectors.py) | `CoarseMeasurement`, `FineMeasurement` (now carries an optional `classifications` list), `DetectedRegion`, mean-based CA-CFAR (`cfar_threshold_1d`), region merging. |
+| [spectrum_grid.py](spectrum_engine/spectrum_grid.py) | `SpectrumCell` dataclass + `CellState` enum, `build_grid`, `map_measurement_to_cells`. |
+| [scheduler.py](spectrum_engine/scheduler.py) | `Scheduler.choose_next_measurement` interleaves coverage scans with priority work (track revisits, group fine scans, priority bands). |
+| [tracks.py](spectrum_engine/tracks.py) | `SignalTrack` lifecycle CANDIDATE → CONFIRMED → TRACKING → LOST → EXPIRED via `TrackManager`. `clear_all()` drops every track. |
 | [occupancy.py](spectrum_engine/occupancy.py) | Per-cell occupancy probability (log-odds), state transitions, activity grouping. |
 | [hierarchy.py](spectrum_engine/hierarchy.py) | Multi-resolution spectrum nodes for zoom-in decisions. |
-| [baseline.py](spectrum_engine/baseline.py) | Slow EWMA noise-floor baseline, energy-delta tracking, uncertainty decay. |
+| [baseline.py](spectrum_engine/baseline.py) | Slow EWMA noise-floor baseline, energy-delta, uncertainty. |
 | [telemetry.py](spectrum_engine/telemetry.py) | Append-only logs in `spectrum_logs/` (gitignored). |
-| [config.py](spectrum_engine/config.py) | YAML loader → `EngineConfig` dataclasses with embedded defaults (works without PyYAML). |
+| [config.py](spectrum_engine/config.py) | YAML loader → `EngineConfig` dataclasses with embedded defaults. |
+
+### `spectrum_engine/sim/` — synthetic SDR + scene preview
+Drop-in replacement for the real SDR backend, plus the ground-truth preview synthesizer. **No pyadi-iio dependency** so the whole stack runs headless on macOS.
+
+| Module | Role |
+|--------|------|
+| [sim/backend.py](spectrum_engine/sim/backend.py) | `SimulatedSDRBackend` — duck-typed `SDRBackend`. `capture()` builds IQ from the active `Scene`, frequency-shifts each emitter into the tuned window, adds noise + DC spike, reshapes for the engine. `set_scene()` swaps the scene live. |
+| [sim/scene.py](spectrum_engine/sim/scene.py) | `Scene`, `Emitter`, `EmitterClass` dataclasses. |
+| [sim/synth.py](spectrum_engine/sim/synth.py) | `gen_awgn`, `gen_analog_fpv` (FM video with sync-tip AM dip so 15.625 kHz survives in the envelope-power FFT), `gen_barrage_jammer` (band-limited noise). |
+| [sim/scenarios.py](spectrum_engine/sim/scenarios.py) | Preset factories: `empty_band`, `fpv_at(hz)`, `jammer_at(hz)`, plus `GUI_PRESETS` driving the Scene combo. |
+| [sim/preview.py](spectrum_engine/sim/preview.py) | `scene_psd_db(scene, start, stop, n_bins)` — analytical full-range PSD. Used by the GUI Sim Preview panel; no IQ involved. |
+
+### `signal_pipeline/` — pluggable signal processors
+Multiple fine-scan algorithms live side-by-side and are selectable at runtime through the GUI Proc combo.
+
+| Module | Role |
+|--------|------|
+| [base.py](signal_pipeline/base.py) | `SignalProcessor` base class (`name`, `label`, `process_fine`). `ClassificationResult` dataclass. |
+| [classic.py](signal_pipeline/classic.py) | `ClassicProcessor` wraps the existing `compute_fine_measurement` unchanged — current default, guaranteed-stable fallback. |
+| [oscfar.py](signal_pipeline/oscfar.py) | `OSCFARProcessor`: integrated PSD → OS-CFAR (75th-percentile sliding window + global noise-floor fallback for wideband emitters) → per-ROI bandwidth/entropy/sync features → heuristic `ANALOG_FPV / BARRAGE_JAMMER / TELEMETRY_LINK / UNKNOWN` classifier. |
+| [registry.py](signal_pipeline/registry.py) | `list_processors()`, `get_processor(name)`, `default_processor()`. Hand-maintained list; first entry is the default. |
 
 ### `proximity_alert/`
 Embeddable alert package — no SDR dependency, safe to import standalone.
 
 | Module | Role |
 |--------|------|
-| [engine.py](proximity_alert/engine.py) | `AlertEngine.update(freq_ghz, signal_dbfs, distance_m, confidence) -> ProximityAlert`. Trend detection, threat classification (NONE / DETECTED / APPROACHING / CRITICAL), boundary hysteresis. |
-| [widget.py](proximity_alert/widget.py) | `ProximityAlertPanel` PyQt5 widget for embedding in any layout. |
-| [ws_server.py](proximity_alert/ws_server.py) | Optional WebSocket bridge for web dashboards. Requires `websockets`. |
-| [demo.py](proximity_alert/demo.py) | Standalone demo (`python -m proximity_alert`) with simulated signals. |
+| [engine.py](proximity_alert/engine.py) | `AlertEngine.update(...)` returns `ProximityAlert` (NONE / DETECTED / APPROACHING / CRITICAL + trend + boundary hysteresis). |
+| [widget.py](proximity_alert/widget.py) | `ProximityAlertPanel` PyQt5 widget. |
+| [ws_server.py](proximity_alert/ws_server.py) | Optional WebSocket bridge. Requires `websockets`. |
+| [demo.py](proximity_alert/demo.py) | Standalone demo (`python -m proximity_alert`). |
 
 ---
 
 ## 4. Running
 
-```bash
-pip install -r requirements.txt          # base
-pip install numba websockets pyyaml      # all optional accelerators / features
+### Mac — simulator only (no hardware required)
 
-python drone_detector.py                 # simple version
-python drone_detector_enhanced.py        # production GUI (adaptive engine if available)
-python -m proximity_alert                # alert demo, no hardware
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install numpy pyqtgraph PyQt5 pyyaml
+python drone_detector_enhanced.py
 ```
 
-The enhanced GUI auto-attaches `SpectrumEngine` when `spectrum_engine` imports cleanly; otherwise it falls back to the classic sweep loop and prints a status string in the engine status label. Engine telemetry lands in `spectrum_logs/`.
+`pyadi-iio` is intentionally skipped — `libiio` is awkward on macOS and the simulator does not need it. In the GUI: **Src** → `Simulator`, pick a **Scene**, click **Simulate**, then click **Detect: OFF** to flip it ON when you're ready to run detection.
+
+### Linux — real Pluto (full hardware path)
+
+```bash
+sudo apt install -y libiio0 libiio-utils python3-libiio
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+pip install pyyaml             # YAML config support
+pip install numba              # optional CFAR JIT
+python drone_detector_enhanced.py
+```
+
+In the GUI: **Src** → `Hardware`, click **Receiver On**. (See troubleshooting in [README.md](README.md) §Requirements for udev rules etc.)
+
+### Headless / scripted (no Qt)
+
+```python
+import time
+from spectrum_engine import SpectrumEngine
+from spectrum_engine.sim import SimulatedSDRBackend, scenarios
+from signal_pipeline import OSCFARProcessor
+
+eng = SpectrumEngine(telemetry_enabled=False)
+eng.set_processor(OSCFARProcessor())
+eng.attach_backend(SimulatedSDRBackend(eng.cfg, scenarios.fpv_at(5.8e9)))
+eng.set_active_range(eng.cfg.frequency_range.start_hz, eng.cfg.frequency_range.stop_hz)
+for _ in range(800):
+    snap = eng.step(now=time.monotonic())
+```
+
+This is the same path the integration tests will take.
 
 ---
 
@@ -103,6 +179,7 @@ The enhanced GUI auto-attaches `SpectrumEngine` when `spectrum_engine` imports c
 - Sample rate / RF BW driven from `engine_config.yaml.hardware`. Defaults are 40 MS/s, 40 MHz BW; coarse FFT 512 bins, fine FFT 4096 bins.
 - `SDRBackend` is paranoid about pyadi-iio buffer ordering (destroy-then-retune-then-read). Don't reorder those calls.
 - Dual-channel mode (omni + directional antenna) requires Pluto 2r2t firmware. Single-RX hardware mirrors omni into dir.
+- macOS Docker Desktop **cannot** map a Pluto over USB. Real-hardware deployment is Linux-only; everything else (sim, dev, CI) runs anywhere.
 
 ---
 
@@ -110,59 +187,110 @@ The enhanced GUI auto-attaches `SpectrumEngine` when `spectrum_engine` imports c
 
 - **Python 3.8+**. Code uses `from __future__ import annotations` and `dataclasses`.
 - **NumPy first.** All hot paths are vectorised; SciPy is used sparingly (Welch / windowing rolled by hand in [psd.py](spectrum_engine/psd.py) to control the window-sum normalisation explicitly).
-- **dBFS** is the default power unit (ratios to ADC full scale 2048). The classic detectors and the engine both feed dBFS through detection logic — keep new code in dBFS unless you have a reason to leave.
+- **dBFS** is the default power unit (ratios to ADC full scale 2048). Keep new code in dBFS unless you have a reason to leave.
 - **Frequencies in Hz** everywhere internal; convert to GHz only at the UI / alert boundary.
 - **Immutable snapshots** cross thread boundaries (`EngineSnapshot` between worker thread and Qt main thread). Arrays are copies.
+- **Stateless processors.** `SignalProcessor` instances may have internal caches (FFT windows etc.), but `process_fine(...)` must depend only on its arguments — that is what makes the GUI Proc combo's runtime swap safe.
 - **Telemetry / debug logs** go under `spectrum_logs/` (already gitignored). Never write logs to repo-tracked paths.
-- **No test suite yet** — verify by running the GUI or `python -m proximity_alert`. The new SDR simulator (planned, see §8) is the first piece that will enable headless tests.
+- **No formal test suite yet.** Verification is via the headless script in §4, the offscreen Qt smoke tests in `drone_detector_enhanced` (run with `QT_QPA_PLATFORM=offscreen`), or hand-run of the GUI. A proper `tests/` directory is a tracked follow-up.
 
 ---
 
-## 7. Existing CA-CFAR (legacy + engine)
+## 7. Detection algorithms (plug-ins)
 
-For reference when extending detection — both implementations follow the same shape:
+Every fine-scan detection runs through the **active `SignalProcessor`**, selected via the GUI Proc combo and held in `SpectrumEngine._processor`. The engine itself never picks an algorithm; it dispatches whatever is registered.
 
-- Vectorised mean of a training window on each side of a Cell Under Test, **plus a guard region** to keep signal energy out of the noise estimate.
-- Threshold = mean + `threshold_offset_db` (≈ 6 dB default). Above-threshold contiguous bins become regions; regions < `min_region_bw_hz` are dropped; pairs separated by < 1 MHz are merged.
-- The classic detector in [drone_detector_enhanced.py](drone_detector_enhanced.py) additionally OR-s CA-CFAR with a fixed dBFS threshold as a safety fallback.
+### Available processors
 
-This is **mean-based CA-CFAR**. The new Signal Processing Pipeline (§8) layers in an **OS-CFAR** (Ordered-Statistic) variant that uses a percentile of the sorted reference window — more robust against interferers inside the training cells. The two should coexist; the existing CA-CFAR path is the engine's primary trigger and stays as-is.
+| `name` | `label` | What it does |
+|--------|---------|--------------|
+| `classic` | Classic (CA-CFAR) | Wraps the existing `compute_fine_measurement` — mean-based CA-CFAR with guard cells, threshold = mean + `threshold_offset_db`, contiguous-bin region clustering, gap merging. Same behaviour as the engine had before the plug-in refactor. **This is the default.** |
+| `oscfar` | OS-CFAR + Classifier | 5-stage pipeline: integrated PSD → 75th-percentile OS-CFAR with global noise-floor fallback for wideband emitters → per-ROI bandwidth, Shannon entropy, sync-pulse detection at 15.625 kHz → heuristic classifier → `ClassificationResult`. Spec-driven implementation that catches the wideband jammers Classic is blind to. |
 
----
+### Adding a new processor
 
-## 8. Signal Processing Pipeline (new module, planned)
+1. Write a class in `signal_pipeline/` inheriting `SignalProcessor`, set `name` and `label`, implement `process_fine(capture, psd_db, freq_axis_hz, cfg) -> FineMeasurement`.
+2. Append it to `_PROCESSORS` in [registry.py](signal_pipeline/registry.py).
+3. Done — the GUI Proc combo picks it up automatically.
 
-A deterministic feed-forward filter chain for **edge-side analog FPV classification**. It consumes the same IQ buffers produced by `SDRBackend.capture()` and emits structured detection telemetry. Target execution time per dwell buffer: **< 10 ms**.
+The engine, the scheduler, the track manager, and the GUI need no changes. Existing processors (especially Classic) are preserved as fallbacks; nothing is archived.
 
-### Stages
+### Performance budget
 
-| # | Stage | Output |
-|---|-------|--------|
-| 1 | **Pre-processing** — split IQ into M segments of N (default 1024), Hamming window each, FFT, magnitude-squared, average → integrated PSD. | 1-D PSD array |
-| 2 | **OS-CFAR trigger** — sliding window over the PSD: guard cells = 4 (2/side), reference cells = 16 (8/side), threshold = α × P_k where P_k is the 75th-percentile reference cell. Flag bins > threshold, cluster contiguous bins into ROIs. Early-exit if zero ROIs. | list of ROI bin ranges |
-| 3 | **Feature extraction** per ROI — bandwidth (Δbin × fs/N), Shannon spectral entropy over normalised in-ROI power, sync-pulse detection by FFT of in-ROI envelope power looking for cyclic spikes at **15.625 kHz** (analog horizontal video sync) and **50 / 60 Hz** (frame refresh). | feature dict per ROI |
-| 4 | **Classification** — hardcoded heuristic decision matrix: `ANALOG_FPV` (BW 6-10 MHz, moderate entropy, 15.625 kHz sync present), `BARRAGE_JAMMER` (BW > 12 MHz, very high entropy, no sync), `TELEMETRY_LINK` (BW < 1 MHz). Else `UNKNOWN`. | classification + confidence 0..1 |
-| 5 | **Output** — dataclass: `frequency_hz`, `bandwidth_hz`, `signal_strength_db`, `classification`, `confidence_score`. | structured detection telemetry |
-
-### Architectural priorities
-
-- **Early-discard pattern.** Stage 2 returning zero ROIs must exit before stages 3-5 run.
-- **Vectorised math.** Stays on NumPy / SciPy so it can be JIT'd (Numba) or moved to hardware-accelerated SIMD later without changing the call graph.
-- **Decoupled state.** Pipeline takes one immutable IQ buffer in, returns one immutable telemetry struct out. Knows nothing about the sweep scheduler or SDR wrapper. This is what makes it droppable into [SpectrumEngine.step()](spectrum_engine/engine.py) without rewiring threading.
-
-### Where it will live (planned)
-
-A new package, tentatively `signal_pipeline/`, separate from `spectrum_engine/detectors.py`. The existing CA-CFAR is **not** being replaced — the new module is a parallel **classification** pass that consumes the same IQ buffers and complements the engine's track manager with semantic labels.
-
-Integration plan: [signal_processing_integration_plan.md](signal_processing_integration_plan.md).
-Offline test harness plan: [sdr_simulator_plan.md](sdr_simulator_plan.md).
+The spec target for new processors is **< 10 ms per fine-scan buffer**. Measured `OSCFARProcessor.process_fine` p95 is ~2.5 ms on a 2026-era MacBook against the default 4096-bin fine PSD; Classic is sub-ms.
 
 ---
 
-## 9. Things to avoid
+## 8. Signal Processing Pipeline — implemented
+
+The five-stage pipeline (Hamming-style integrated PSD → OS-CFAR → features → classifier → structured output) called out in the original user spec is now shipped as `OSCFARProcessor`. The standing reference for tuning and known limitations is [signal_processing_integration_plan.md](signal_processing_integration_plan.md). For the plug-in architecture this processor lives inside, see [signal_processing_selector_plan.md](signal_processing_selector_plan.md).
+
+Key empirical results from the implementation:
+
+- All 7 simulator presets (Empty band + FPV @ 1.3 / 2.4 / 3.7 / 5.8 / 6.2 GHz + Jammer @ 2.45 GHz) classify correctly.
+- OS-CFAR's small reference window (16 cells ≈ 78 kHz) sits inside an 8 MHz FPV emitter, so its raw output misses wideband signals. The implementation combines OS-CFAR with a **global noise-floor fallback** (30th-percentile of the PSD + α) and takes the minimum — narrowband sensitivity intact, wideband coverage restored.
+- Empirically, Shannon entropy is **not** a useful discriminator at this resolution: FM video and band-limited noise both occupy many bins relatively uniformly. The v1 classifier keys on bandwidth + horizontal sync detection only; entropy is kept in the feature snapshot for telemetry / future tuning.
+- Real FPV transmitters are pure FM (constant envelope) on paper, but residual AM at the sync tip produces the 15.625 kHz envelope-power line the classifier looks for. The simulator's `gen_analog_fpv` reproduces this on purpose.
+
+---
+
+## 9. GUI operator controls
+
+Top bar (left → right) in [drone_detector_enhanced.py](drone_detector_enhanced.py):
+
+| Control | What it does |
+|---------|--------------|
+| `Src:` Hardware / Simulator | Picks the IQ source. Hardware uses pyadi-iio; Simulator uses `SimulatedSDRBackend`. |
+| `Scene:` preset combo | Active only in Simulator mode. Presets: Empty band, FPV @ 1.3 / 2.4 / 3.7 / 5.8 / 6.2 GHz, Jammer @ 2.45 GHz. Live-swap supported via `SimulatedSDRBackend.set_scene`. |
+| `Proc:` Classic / OS-CFAR | Picks the `SignalProcessor`. Runtime swap via `SpectrumEngine.set_processor`. |
+| **Simulate / Stop simulation** (Simulator) / **Receiver On / Receiver Off** (Hardware) | Contextual primary button. Green when off, red when on. |
+| **Detect: OFF / ON** | Detection toggle. **Default OFF** on launch — the operator inspects raw signal first, then opts in. Going from ON → OFF clears every cell back to `UNKNOWN` and drops every track. |
+
+Main display:
+
+- **RX1 (Omni) — Spectrum + Waterfall**: live receiver view inside whatever 20 MHz window the engine is currently tuned to.
+- **Simulated Signal (1.0–6.5 GHz) — Spectrum + Waterfall** (formerly RX2 in the layout): **analytical** ground-truth PSD of the active simulator scene, refreshed at 5 Hz on its own timer, independent of the engine loop. Blank in Hardware mode.
+
+The Sim Preview panel is purely visual — no IQ, no detection, no algorithm runs against it. It's the "you-are-here" reference for what scene you've selected.
+
+---
+
+## 10. Things to avoid
 
 - Don't change the destroy-buffer-then-retune-then-read order in `SDRBackend._read_natural` — pyadi-iio breaks silently if you reorder them (errno-0 stalls, zero scans).
 - Don't change `rx_buffer_size` inside `SDRBackend.capture()` — see the comment in [sdr_backend.py:131](spectrum_engine/sdr_backend.py:131); larger buffers change the sample layout and broke captures entirely in the past.
-- Don't drop the DC-spike excision in `SpectrumEngine._process_capture` — PlutoSDR leaks LO into the centre FFT bin every capture, and removing the excision lights up every cell with a false centre signal.
+- Don't drop the DC-spike excision in `SpectrumEngine._process_capture` — PlutoSDR leaks LO into the centre FFT bin every capture, and removing the excision lights up every cell with a false centre signal. The simulator deliberately reproduces this spike.
 - Don't widen the scheduler's priority cadence beyond `_PRIORITY_EVERY = 4` — small priority-band revisit intervals (0.5 s) used to monopolise the scheduler and starve coverage.
 - Don't print to stdout from worker threads — use `error_occurred` signal or telemetry log.
+- Don't make `SignalProcessor` instances stateful across calls. The GUI Proc swap and the engine loop both rely on `process_fine` being a function of its arguments. Caches (windows, lookup tables) are fine; observation state is not.
+- Don't let `signal_pipeline` import anything from `spectrum_engine.engine` at module top — only `spectrum_engine.detectors` / `config` / `sdr_backend` (the data dataclasses). The engine imports the registry, so the reverse direction would cycle. `classic.py` already uses a lazy `compute_fine_measurement` import for exactly this reason.
+- Don't write data to `spec_dir` / `wf_dir` from the main display loop — those widgets are now the Sim Preview panel, driven exclusively by `_refresh_sim_preview`.
+
+---
+
+## 11. How this document stays current
+
+This file is the **first place** anyone (human or AI) should look to understand the project, and it ages badly if no one is responsible for keeping it fresh. The contract:
+
+> **Whenever a change lands that affects any of the items below, the same commit (or the immediately following commit) must update this file.**
+
+| If you change... | Update §... |
+|------------------|-------------|
+| The data flow between source / engine / processor / GUI | §2 diagram |
+| File/module layout in `spectrum_engine/`, `signal_pipeline/`, `proximity_alert/`, top-level | §3 codebase map |
+| Install steps, deps, supported platforms | §4 Running |
+| Hardware tuning ranges, libiio behaviour | §5 Hardware notes |
+| Coding conventions, threading rules, default units | §6 Conventions |
+| Set of available processors, processor budgets, registry mechanics | §7 |
+| Signal-processing spec or its implementation | §8 (and the corresponding plan doc) |
+| GUI controls — combos, buttons, panels | §9 |
+| Newly discovered footguns / hard-learned rules | §10 |
+
+Rules for AI agents touching code in this repo:
+
+1. **Read this file at the start of any session before touching code.**
+2. **Update this file at the end of any session that changes architecture, files, controls, conventions, or installs.** Mention which sections changed in the commit message.
+3. **Don't create a new planning doc when an existing one applies.** If a change relates to the simulator, update [sdr_simulator_plan.md](sdr_simulator_plan.md). Algorithm selector → [signal_processing_selector_plan.md](signal_processing_selector_plan.md). New processor → [signal_processing_integration_plan.md](signal_processing_integration_plan.md). Only create new plan docs for genuinely new scope.
+4. **Prefer linking over duplicating.** This doc is a map. Detail belongs in the plans, READMEs, or the code comments — link to them from here, don't copy them in.
+5. **If a section in this doc disagrees with the code, fix the code or fix the doc — never leave them inconsistent.** Note the resolution in your commit message.
+6. **Treat the "Things to avoid" list (§10) as load-bearing.** Each entry is a real incident or principle. Don't remove an entry without explaining why in the commit.
