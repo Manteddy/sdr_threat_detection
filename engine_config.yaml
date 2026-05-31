@@ -78,3 +78,8 @@ bayesian:
 inference:
   enabled: false
   weight: 1.0
+
+experiments:
+  root: experiments
+  heatmap_snapshot_hz: 1.0
+  max_queue_frames: 256

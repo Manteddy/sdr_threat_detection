@@ -169,6 +169,11 @@ class SpectrumEngine:
         # Runtime state
         self._backend: Optional[SignalReader] = None
         self._processor: SignalProcessor = default_processor()
+        # Optional experiment recorder (set via attach_recorder)
+        self._recorder = None
+        # Optional replay source (set via attach_replay_source); when set,
+        # step() uses the source's recorded commands instead of the scheduler.
+        self._replay_source = None
         # Operating stage (see EngineStage docstring). Default CLASSIFY
         # keeps existing callers (headless smoke scripts) running the full
         # pipeline without opt-in. The GUI sets IDLE at construction and
@@ -253,6 +258,20 @@ class SpectrumEngine:
 
     # Back-compat alias used during the migration. New callers should
     # call `set_stage(EngineStage.CLASSIFY | PROCESS)` directly.
+    def attach_recorder(self, recorder) -> None:
+        """Attach an ExperimentRecorder. Pass None to detach."""
+        self._recorder = recorder
+
+    def detach_recorder(self) -> None:
+        self._recorder = None
+
+    def attach_replay_source(self, replay_source) -> None:
+        """Attach a ReplayIQSource to override the scheduler with recorded commands."""
+        self._replay_source = replay_source
+
+    def detach_replay_source(self) -> None:
+        self._replay_source = None
+
     def set_detection_enabled(self, enabled: bool) -> None:
         self.stage = EngineStage.CLASSIFY if enabled else EngineStage.PROCESS
 
@@ -334,9 +353,19 @@ class SpectrumEngine:
         self.scheduler.update_scores(self.cells, now)
 
         # --- 2. Pick next measurement ---
-        cmd = self.scheduler.choose_next_measurement(
-            self.cells, self.track_mgr.active_tracks, groups, now,
-        )
+        if self._replay_source is not None:
+            if self._replay_source.is_exhausted:
+                # Recording finished — snap back to Idle cleanly
+                self.set_stage(EngineStage.IDLE)
+                return self._make_snapshot(now, groups)
+            cmd = self._replay_source.get_next_command()
+            if cmd is None:
+                self.set_stage(EngineStage.IDLE)
+                return self._make_snapshot(now, groups)
+        else:
+            cmd = self.scheduler.choose_next_measurement(
+                self.cells, self.track_mgr.active_tracks, groups, now,
+            )
         self._last_cmd = cmd
 
         # --- 3. Capture IQ ---
@@ -356,11 +385,25 @@ class SpectrumEngine:
 
         capture_time = time.monotonic()
 
+        # Notify recorder (non-blocking; recorder queues to background thread)
+        if self._recorder is not None:
+            try:
+                self._recorder.on_capture(capture, cmd)
+            except Exception:
+                pass
+
         try:
-            return self._process_capture(cmd, capture, capture_time, groups, cfg)
+            snapshot = self._process_capture(cmd, capture, capture_time, groups, cfg)
         except Exception as exc:
             self._debug_log("process", exc, cmd)
             return self._make_snapshot(now, groups)
+
+        if self._recorder is not None:
+            try:
+                self._recorder.on_snapshot(snapshot)
+            except Exception:
+                pass
+        return snapshot
 
     def _process_capture(self, cmd, capture, capture_time, groups, cfg):
         """PSD → cell update → grouping → fine detect → tracks → snapshot."""

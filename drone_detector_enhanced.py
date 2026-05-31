@@ -31,9 +31,12 @@ from PyQt5.QtWidgets import (
     QLabel, QPushButton, QSlider, QGroupBox, QCheckBox,
     QScrollArea, QFrame, QSplitter, QLineEdit, QDoubleSpinBox, QSpinBox,
     QComboBox, QButtonGroup,
+    QDialog, QTextEdit, QDialogButtonBox, QFormLayout,
+    QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
+    QDockWidget, QMessageBox, QFileDialog,
 )
-from PyQt5.QtCore import QTimer, Qt, QRectF, QThread, pyqtSignal
-from PyQt5.QtGui import QFont
+from PyQt5.QtCore import QTimer, Qt, QRectF, QThread, pyqtSignal, QSize
+from PyQt5.QtGui import QFont, QColor
 import pyqtgraph as pg
 
 from proximity_alert.engine import AlertEngine
@@ -69,6 +72,15 @@ HAS_PIPELINE = False
 try:
     from signal_pipeline import list_processors, get_processor
     HAS_PIPELINE = True
+except Exception:
+    pass
+
+# ---- Experiment recording / replay ----
+HAS_EXPERIMENTS = False
+try:
+    from experiments import ExperimentRecorder, RecordingOptions
+    from spectrum_engine.sources.replay import ReplayIQSource
+    HAS_EXPERIMENTS = True
 except Exception:
     pass
 
@@ -534,6 +546,13 @@ class SweepWorker(QThread):
                     self.engine_update.emit(snapshot)
                     last_emit = now
 
+                # Replay exhaustion: engine snaps to IDLE internally; stop loop.
+                if engine.stage.value == 0:  # EngineStage.IDLE
+                    break
+
+            except StopIteration:
+                # Replay source exhausted
+                break
             except Exception as e:
                 self.error_occurred.emit(str(e)[:80])
                 time.sleep(0.1)
@@ -665,6 +684,279 @@ class SweepWorker(QThread):
         self.wait(3000)
 
 
+# ------------------------------------------------------------ Experiment dialog
+
+class ExperimentDialog(QDialog):
+    """Modal shown when the user clicks REC to start a new recording."""
+
+    def __init__(self, parent=None, heatmap_hz: float = 1.0, max_duration_s: float = 300.0):
+        super().__init__(parent)
+        self.setWindowTitle("New Experiment")
+        self.setMinimumWidth(420)
+        self.setStyleSheet(
+            "background:#12121e;color:#ccc;"
+            "QLineEdit,QTextEdit,QDoubleSpinBox,QSpinBox{"
+            "  background:#1e1e2e;color:#eee;border:1px solid #444;"
+            "  padding:3px;}"
+            "QLabel{color:#aaa;}"
+            "QPushButton{background:#2a2a4a;color:#0ff;border:1px solid #444;"
+            "  padding:4px 10px;}"
+            "QPushButton:hover{background:#3a3a5a;}"
+        )
+
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignRight)
+
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("e.g. fpv-5g8-rooftop")
+        form.addRow("Name *:", self.name_edit)
+
+        self.comment_edit = QTextEdit()
+        self.comment_edit.setPlaceholderText("Free-form notes about this recording…")
+        self.comment_edit.setFixedHeight(80)
+        form.addRow("Comment:", self.comment_edit)
+
+        self.duration_spin = QSpinBox()
+        self.duration_spin.setRange(0, 3600)
+        self.duration_spin.setValue(int(max_duration_s))
+        self.duration_spin.setSuffix(" s  (0 = no limit)")
+        self.duration_spin.setFixedWidth(160)
+        form.addRow("Max duration:", self.duration_spin)
+
+        self.heatmap_spin = QDoubleSpinBox()
+        self.heatmap_spin.setRange(0.1, 10.0)
+        self.heatmap_spin.setDecimals(1)
+        self.heatmap_spin.setValue(heatmap_hz)
+        self.heatmap_spin.setSuffix(" Hz")
+        self.heatmap_spin.setFixedWidth(100)
+        form.addRow("Heatmap rate:", self.heatmap_spin)
+
+        dtype_label = QLabel("int16 I/Q  (lossless, 4 bytes/sample)")
+        dtype_label.setStyleSheet("color:#666;font-size:10px;")
+        form.addRow("IQ format:", dtype_label)
+
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel,
+            Qt.Horizontal, self
+        )
+        buttons.button(QDialogButtonBox.Ok).setText("Start Recording")
+        buttons.button(QDialogButtonBox.Ok).setStyleSheet(
+            "background:#5a2a00;color:#fa0;border:1px solid #884400;padding:4px 12px;"
+        )
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _on_accept(self):
+        if not self.name_edit.text().strip():
+            self.name_edit.setStyleSheet(
+                "background:#3a1a1a;border:1px solid #f44;color:#eee;padding:3px;"
+            )
+            return
+        self.accept()
+
+    def options(self) -> "RecordingOptions":
+        return RecordingOptions(
+            name=self.name_edit.text().strip(),
+            comment=self.comment_edit.toPlainText().strip(),
+            max_duration_s=float(self.duration_spin.value()),
+            heatmap_snapshot_hz=float(self.heatmap_spin.value()),
+        )
+
+
+# ------------------------------------------------------------ Experiment browser dock
+
+class ExperimentBrowserDock(QDockWidget):
+    """Right-side dock: table of past experiments with Load/Open/Delete."""
+
+    load_requested = pyqtSignal(str)   # emits experiment folder path
+
+    def __init__(self, parent=None, experiments_root: str = "experiments"):
+        super().__init__("Experiments", parent)
+        self.setObjectName("ExperimentBrowserDock")
+        self._root = experiments_root
+        self.setAllowedAreas(Qt.RightDockWidgetArea | Qt.LeftDockWidgetArea)
+        self.setMinimumWidth(340)
+
+        container = QWidget()
+        container.setStyleSheet("background:#0e0e1a;color:#ccc;")
+        vbox = QVBoxLayout(container)
+        vbox.setContentsMargins(4, 4, 4, 4)
+        vbox.setSpacing(4)
+
+        # Table
+        self._table = QTableWidget(0, 5)
+        self._table.setHorizontalHeaderLabels(
+            ["Name", "Date", "Duration", "Frames", "Status"]
+        )
+        self._table.horizontalHeader().setStretchLastSection(False)
+        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        for col in range(1, 5):
+            self._table.horizontalHeader().setSectionResizeMode(
+                col, QHeaderView.ResizeToContents
+            )
+        self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._table.setAlternatingRowColors(True)
+        self._table.setStyleSheet(
+            "QTableWidget{background:#0e0e1a;color:#ccc;gridline-color:#2a2a3a;"
+            " alternate-background-color:#13132a;}"
+            "QHeaderView::section{background:#1a1a2e;color:#888;border:none;"
+            " padding:3px;}"
+            "QTableWidget::item:selected{background:#1e3a5a;color:#0ff;}"
+        )
+        vbox.addWidget(self._table, 1)
+
+        # Button row
+        btn_row = QHBoxLayout()
+        self._load_btn = QPushButton("Load (Replay)")
+        self._load_btn.setStyleSheet(BTN_STYLE)
+        self._load_btn.clicked.connect(self._on_load)
+        btn_row.addWidget(self._load_btn)
+
+        self._open_btn = QPushButton("Open Folder")
+        self._open_btn.setStyleSheet(BTN_STYLE)
+        self._open_btn.clicked.connect(self._on_open_folder)
+        btn_row.addWidget(self._open_btn)
+
+        self._delete_btn = QPushButton("Delete")
+        self._delete_btn.setStyleSheet(
+            "QPushButton{background:#2a0a0a;color:#f66;border:1px solid #622;"
+            "padding:3px;}"
+            "QPushButton:hover{background:#3a1a1a;}"
+        )
+        self._delete_btn.clicked.connect(self._on_delete)
+        btn_row.addWidget(self._delete_btn)
+        vbox.addLayout(btn_row)
+
+        self.setWidget(container)
+        self._folders: list = []   # parallel to table rows
+
+    def set_root(self, root: str) -> None:
+        self._root = root
+
+    def refresh(self) -> None:
+        """Scan the experiments root and rebuild the table."""
+        import datetime
+
+        self._table.setRowCount(0)
+        self._folders = []
+
+        if not os.path.isdir(self._root):
+            return
+
+        entries = []
+        for name in sorted(os.listdir(self._root), reverse=True):
+            path = os.path.join(self._root, name)
+            if not os.path.isdir(path):
+                continue
+            exp_path = os.path.join(path, "experiment.json")
+            idx_path = os.path.join(path, "INDEX.json")
+            meta = {}
+            if os.path.isfile(exp_path):
+                try:
+                    import json as _json
+                    with open(exp_path, "r") as fh:
+                        meta = _json.load(fh)
+                except Exception:
+                    pass
+            complete = os.path.isfile(idx_path)
+            entries.append((name, path, meta, complete))
+
+        for name, path, meta, complete in entries:
+            row = self._table.rowCount()
+            self._table.insertRow(row)
+            self._folders.append(path)
+
+            disp_name = meta.get("name", name)
+            start_ts = meta.get("start_ts", 0)
+            dur = meta.get("duration_s", 0)
+            frames = meta.get("iq_frames", "?")
+
+            if start_ts:
+                try:
+                    dt = datetime.datetime.fromtimestamp(start_ts)
+                    date_str = dt.strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    date_str = name[:16]
+            else:
+                date_str = name[:16]
+
+            dur_str = f"{int(dur // 60)}m{int(dur % 60):02d}s" if dur else "?"
+            status_str = "complete" if complete else "interrupted"
+            status_color = "#8f8" if complete else "#fa0"
+
+            items = [
+                QTableWidgetItem(disp_name),
+                QTableWidgetItem(date_str),
+                QTableWidgetItem(dur_str),
+                QTableWidgetItem(str(frames)),
+                QTableWidgetItem(status_str),
+            ]
+            for col, item in enumerate(items):
+                item.setForeground(
+                    QColor("#ccc") if col < 4 else QColor(status_color)
+                )
+                self._table.setItem(row, col, item)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.refresh()
+
+    def _selected_folder(self):
+        rows = self._table.selectedItems()
+        if not rows:
+            return None
+        row = self._table.currentRow()
+        if row < 0 or row >= len(self._folders):
+            return None
+        return self._folders[row]
+
+    def _on_load(self):
+        folder = self._selected_folder()
+        if folder:
+            self.load_requested.emit(folder)
+
+    def _on_open_folder(self):
+        folder = self._selected_folder()
+        if not folder:
+            return
+        import subprocess, platform
+        try:
+            if platform.system() == "Darwin":
+                subprocess.Popen(["open", folder])
+            elif platform.system() == "Windows":
+                subprocess.Popen(["explorer", folder])
+            else:
+                subprocess.Popen(["xdg-open", folder])
+        except Exception:
+            pass
+
+    def _on_delete(self):
+        folder = self._selected_folder()
+        if not folder:
+            return
+        name = os.path.basename(folder)
+        reply = QMessageBox.question(
+            self, "Delete experiment",
+            f"Delete '{name}' and all its files?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        import shutil
+        try:
+            shutil.rmtree(folder)
+        except Exception as exc:
+            QMessageBox.warning(self, "Delete failed", str(exc))
+        self.refresh()
+
+
 # ------------------------------------------------------------ Main Window
 class DroneDetector(QMainWindow):
     def __init__(self):
@@ -695,6 +987,13 @@ class DroneDetector(QMainWindow):
         self._engine = None
         self._engine_backend = None
         self._engine_scan_count = 0
+
+        # Experiment recording state
+        self._recorder = None          # ExperimentRecorder | None
+        self._rec_start_time = 0.0
+        self._rec_timer = QTimer()
+        self._rec_timer.setInterval(500)
+        self._rec_timer.timeout.connect(self._update_rec_status)
 
         # Scan-coverage "fire up" heat buffer (lazily sized on first snapshot)
         self._scan_heat = None
@@ -746,6 +1045,12 @@ class DroneDetector(QMainWindow):
         self.update_timer.timeout.connect(self._update_display)
         self._sim_preview_timer = QTimer(self)
         self._sim_preview_timer.timeout.connect(self._refresh_sim_preview)
+
+        # Experiment browser dock (always constructed; shown on demand)
+        self._exp_browser = ExperimentBrowserDock(self, "experiments")
+        self._exp_browser.load_requested.connect(self._on_experiment_load)
+        self.addDockWidget(Qt.RightDockWidgetArea, self._exp_browser)
+        self._exp_browser.hide()
 
     # -------------------------------------------------------- Sweep math
     def _recalc_sweep(self):
@@ -829,13 +1134,15 @@ class DroneDetector(QMainWindow):
         self.freq_label.setStyleSheet("color:#0ff;padding:2px;")
         top.addWidget(self.freq_label)
 
-        # ---- Source selector (Hardware vs Simulator) ----
+        # ---- Source selector (Hardware / Simulator / Replay) ----
         top.addWidget(self._lbl("Src:"))
         self.source_combo = QComboBox()
         self.source_combo.addItem("Hardware")
         if HAS_SIM and HAS_ENGINE:
             self.source_combo.addItem("Simulator")
-        self.source_combo.setFixedWidth(100)
+        if HAS_EXPERIMENTS and HAS_ENGINE:
+            self.source_combo.addItem("Replay")
+        self.source_combo.setFixedWidth(105)
         self.source_combo.setStyleSheet(INPUT_STYLE)
         self.source_combo.currentIndexChanged.connect(self._on_source_changed)
         top.addWidget(self.source_combo)
@@ -898,6 +1205,23 @@ class DroneDetector(QMainWindow):
         self._stage: "EngineStage" = EngineStage.IDLE
         self._stage_buttons[EngineStage.IDLE].setChecked(True)
         self._refresh_stage_buttons()
+
+        # ---- REC button (hardware-only recording) ----
+        top.addSpacing(12)
+        self._rec_btn = QPushButton("REC")
+        self._rec_btn.setFixedWidth(80)
+        self._rec_btn.setCheckable(False)
+        self._rec_btn.setStyleSheet(
+            "QPushButton{background:#1e1e26;color:#666;"
+            "border:1px solid #333;padding:5px;font-weight:bold;}"
+        )
+        self._rec_btn.setEnabled(False)
+        self._rec_btn.setToolTip(
+            "Record this session to disk"
+        )
+        self._rec_btn.clicked.connect(self._on_rec_clicked)
+        top.addWidget(self._rec_btn)
+
         root.addLayout(top)
 
         # ---- Controls bar row 1 ----
@@ -1732,6 +2056,10 @@ class DroneDetector(QMainWindow):
         self.sweep_worker.stop()
         self.update_timer.stop()
 
+        # Stop any active recording first
+        if self._recorder is not None and getattr(self._recorder, "is_running", False):
+            self._stop_recording()
+
         # Shut down engine telemetry
         if self._engine is not None:
             try:
@@ -1831,23 +2159,329 @@ class DroneDetector(QMainWindow):
             self.status_label.setStyleSheet("color:#f44;")
             return False
 
+    # ------------------------------------------------------------ Replay connect
+
+    def _connect_replay(self, target_stage=None):
+        """Connect to a recorded experiment folder for replay."""
+        target_stage = target_stage if target_stage is not None else EngineStage.CLASSIFY
+        if not (HAS_EXPERIMENTS and HAS_ENGINE):
+            self.status_label.setText("Replay unavailable (needs spectrum_engine + experiments)")
+            self.status_label.setStyleSheet("color:#f44;")
+            return False
+
+        # Find selected folder from browser dock
+        folder = self._exp_browser._selected_folder()
+        if not folder:
+            # Try a file picker as fallback
+            folder = QFileDialog.getExistingDirectory(
+                self, "Select experiment folder", "experiments"
+            )
+        if not folder:
+            self.status_label.setText("Replay: no experiment selected")
+            self.status_label.setStyleSheet("color:#f44;")
+            return False
+
+        try:
+            replay_source = ReplayIQSource(folder)
+            eng_cfg = _load_engine_config()
+            # Use the recorded adc_full_scale if available
+            rec_hw = replay_source.meta.get("hardware", {})
+            if "adc_full_scale" in rec_hw:
+                eng_cfg.hardware.adc_full_scale = float(rec_hw["adc_full_scale"])
+
+            self.sdr = None
+            self.dual_channel = False
+            self.connected = True
+
+            exp_name = replay_source.meta.get("name", os.path.basename(folder))
+            proc_name = replay_source.meta.get("processor", "?")
+            self.spec_dir.setTitle("Replay", color="#ff8800", size="9pt")
+            self.status_label.setText(
+                f"REPLAY: {exp_name} — {replay_source.total_frames} frames "
+                f"[{proc_name}]"
+            )
+            self.status_label.setStyleSheet("color:#fa0;")
+
+            self._reset_buffers()
+            self.sweep_worker.configure(
+                None, self.sweep_start_hz, self.num_steps,
+                False, self.spectrum_omni, self.spectrum_dir,
+                spec_omni_welch=self.spectrum_omni_welch,
+                spec_dir_welch=self.spectrum_dir_welch,
+                features=self.features, fastlock=self.fastlock,
+            )
+
+            self._engine = SpectrumEngine(cfg=eng_cfg, telemetry_enabled=False)
+            self._engine_backend = SignalReader(
+                replay_source,
+                eng_cfg,
+                realtime=False,
+                anti_alias=False,   # data already anti-aliased at record time
+            )
+            self._engine.attach_backend(self._engine_backend)
+            self._engine.attach_replay_source(replay_source)
+            self._apply_selected_processor()
+            self._engine.set_stage(target_stage)
+            self._engine.set_active_range(self.sweep_start_hz, self.sweep_end_hz)
+            self.sweep_worker.configure_engine(self._engine, self._engine_backend)
+
+            if self.engine_status_label:
+                self.engine_status_label.setText(
+                    f"Replay — {replay_source.total_frames} frames "
+                    f"[{self._engine.get_processor().label}]"
+                )
+                self.engine_status_label.setStyleSheet("color:#fa0;padding:1px 4px;")
+
+            self.sweep_worker.start()
+            self.update_timer.start(80)
+            return True
+
+        except Exception as e:
+            self.connected = False
+            self.status_label.setText(f"Replay failed: {str(e)[:70]}")
+            self.status_label.setStyleSheet("color:#f44;")
+            return False
+
+    # ------------------------------------------------------------ Recording
+
+    def _on_rec_clicked(self) -> None:
+        """REC button handler: start or stop recording."""
+        is_recording = self._recorder is not None and getattr(
+            self._recorder, "is_running", False
+        )
+        if is_recording:
+            self._stop_recording()
+        else:
+            self._start_recording()
+
+    def _start_recording(self) -> None:
+        if not HAS_EXPERIMENTS:
+            return
+        if self._engine is None:
+            return
+
+        eng_cfg = _load_engine_config()
+
+        # Build hw_cfg from current SDR / engine config
+        hw_cfg = {
+            "sample_rate_hz": eng_cfg.hardware.sample_rate_hz,
+            "bandwidth_hz": eng_cfg.hardware.default_bandwidth_hz,
+            "adc_full_scale": eng_cfg.hardware.adc_full_scale,
+            "min_hz": 70e6,
+            "max_hz": 6000e6,
+        }
+        if self.sdr is not None:
+            try:
+                hw_cfg["gain_db"] = self.gain_slider.value()
+            except Exception:
+                pass
+
+        # Engine config snapshot as plain dict (best-effort)
+        import dataclasses
+        try:
+            eng_cfg_dict = dataclasses.asdict(eng_cfg)
+        except Exception:
+            eng_cfg_dict = {}
+
+        dlg = ExperimentDialog(
+            self,
+            heatmap_hz=eng_cfg.experiments.heatmap_snapshot_hz,
+            max_duration_s=300.0,
+        )
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        opts = dlg.options()
+
+        recorder = ExperimentRecorder(
+            root_dir=eng_cfg.experiments.root,
+            adc_full_scale=eng_cfg.hardware.adc_full_scale,
+        )
+        try:
+            folder = recorder.start(
+                opts,
+                processor_name=self._engine.get_processor().name,
+                engine_cfg_dict=eng_cfg_dict,
+                hw_cfg_dict=hw_cfg,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Recording failed", str(exc))
+            return
+
+        self._recorder = recorder
+        self._rec_start_time = time.monotonic()
+        self._engine.attach_recorder(recorder)
+        self._rec_timer.start()
+        self._update_rec_button()
+        self.status_label.setText(f"Recording → {os.path.basename(folder)}")
+        self.status_label.setStyleSheet("color:#f44;")
+
+    def _stop_recording(self) -> None:
+        if self._recorder is None:
+            return
+        self._rec_timer.stop()
+        folder = self._recorder.stop()
+        if self._engine is not None:
+            self._engine.detach_recorder()
+        self._recorder = None
+        self._update_rec_button()
+        self._exp_browser.refresh()
+        msg = f"Recording saved: {os.path.basename(folder)}" if folder else "Recording stopped"
+        self.status_label.setText(msg)
+        self.status_label.setStyleSheet("color:#0f0;")
+
+    def _update_rec_status(self) -> None:
+        """Timer callback: update REC button with elapsed time and size."""
+        if self._recorder is None or not self._recorder.is_running:
+            self._rec_timer.stop()
+            return
+        elapsed = self._recorder.elapsed_s
+        mins = int(elapsed // 60)
+        secs = int(elapsed % 60)
+        mb = self._recorder.written_bytes / (1024 * 1024)
+        self._rec_btn.setText(f"● {mins}:{secs:02d} / {mb:.0f}MB")
+
+    def _on_experiment_load(self, folder: str) -> None:
+        """Called when the user clicks Load in the browser dock."""
+        # Switch source to Replay and connect
+        combo = self.source_combo
+        idx = combo.findText("Replay")
+        if idx < 0:
+            return
+        # Set combo without triggering _on_source_changed's auto-show logic
+        combo.blockSignals(True)
+        combo.setCurrentIndex(idx)
+        combo.blockSignals(False)
+
+        # Force stage to Idle first if needed
+        if self._stage != EngineStage.IDLE:
+            self._set_stage(EngineStage.IDLE)
+
+        # Make sure the browser has the row selected
+        # (the signal already carries the folder, so just connect)
+        ok = self._connect_replay_with_folder(folder, EngineStage.CLASSIFY)
+        if ok:
+            self._stage = EngineStage.CLASSIFY
+            self._refresh_stage_buttons()
+            self._update_rec_button()
+
+    def _connect_replay_with_folder(self, folder: str, target_stage) -> bool:
+        """Like _connect_replay but uses a specific folder directly."""
+        if not (HAS_EXPERIMENTS and HAS_ENGINE):
+            return False
+        try:
+            replay_source = ReplayIQSource(folder)
+            eng_cfg = _load_engine_config()
+            rec_hw = replay_source.meta.get("hardware", {})
+            if "adc_full_scale" in rec_hw:
+                eng_cfg.hardware.adc_full_scale = float(rec_hw["adc_full_scale"])
+
+            self.sdr = None
+            self.dual_channel = False
+            self.connected = True
+
+            exp_name = replay_source.meta.get("name", os.path.basename(folder))
+            self.status_label.setText(
+                f"REPLAY: {exp_name} — {replay_source.total_frames} frames"
+            )
+            self.status_label.setStyleSheet("color:#fa0;")
+            self._reset_buffers()
+            self.sweep_worker.configure(
+                None, self.sweep_start_hz, self.num_steps,
+                False, self.spectrum_omni, self.spectrum_dir,
+                spec_omni_welch=self.spectrum_omni_welch,
+                spec_dir_welch=self.spectrum_dir_welch,
+                features=self.features, fastlock=self.fastlock,
+            )
+            self._engine = SpectrumEngine(cfg=eng_cfg, telemetry_enabled=False)
+            self._engine_backend = SignalReader(
+                replay_source, eng_cfg, realtime=False, anti_alias=False,
+            )
+            self._engine.attach_backend(self._engine_backend)
+            self._engine.attach_replay_source(replay_source)
+            self._apply_selected_processor()
+            self._engine.set_stage(target_stage)
+            self._engine.set_active_range(self.sweep_start_hz, self.sweep_end_hz)
+            self.sweep_worker.configure_engine(self._engine, self._engine_backend)
+            if self.engine_status_label:
+                self.engine_status_label.setText(
+                    f"Replay [{self._engine.get_processor().label}]"
+                )
+                self.engine_status_label.setStyleSheet("color:#fa0;padding:1px 4px;")
+            self.sweep_worker.start()
+            self.update_timer.start(80)
+            return True
+        except Exception as e:
+            self.connected = False
+            self.status_label.setText(f"Replay failed: {str(e)[:70]}")
+            self.status_label.setStyleSheet("color:#f44;")
+            return False
+
     def _on_source_changed(self, _idx):
-        """Enable scene combo + start/stop the sim preview based on source.
+        """Enable/disable scene combo and sim preview; handle Replay source.
 
         Changing source while a session is active forces a step down to
-        Idle — connection is owned by the stage ladder, so the operator
-        re-engages by clicking back up to Receive/Process/Classify.
+        Idle — connection is owned by the stage ladder.
         """
-        if self.scene_combo is None:
-            return
-        is_sim = self.source_combo.currentText() == "Simulator"
-        self.scene_combo.setEnabled(is_sim)
+        src = self.source_combo.currentText()
+        is_sim = src == "Simulator"
+        is_replay = src == "Replay"
+
+        if self.scene_combo is not None:
+            self.scene_combo.setEnabled(is_sim)
+
         if is_sim:
             self._activate_sim_preview()
         else:
             self._deactivate_sim_preview()
+
+        if is_replay:
+            # Show the browser so the user can select an experiment
+            self._exp_browser.refresh()
+            self._exp_browser.show()
+            self._exp_browser.raise_()
+
         if self._stage is not None and self._stage != EngineStage.IDLE:
             self._set_stage(EngineStage.IDLE)
+
+        self._update_rec_button()
+
+    def _update_rec_button(self) -> None:
+        """Sync REC button enabled/style with current source and stage."""
+        if not hasattr(self, "_rec_btn"):
+            return
+        src = self.source_combo.currentText() if hasattr(self, "source_combo") else ""
+        is_active_source = src in ("Hardware", "Simulator")
+        is_recording = self._recorder is not None and getattr(
+            self._recorder, "is_running", False
+        )
+        stage_ok = self._stage is not None and self._stage >= EngineStage.RECEIVE
+
+        if is_recording:
+            # Red active state — click to stop
+            self._rec_btn.setEnabled(True)
+            self._rec_btn.setStyleSheet(
+                "QPushButton{background:#4a0000;color:#ff4444;"
+                "border:1px solid #aa0000;padding:5px;font-weight:bold;}"
+                "QPushButton:hover{background:#5a0000;}"
+            )
+        elif is_active_source and stage_ok:
+            # Ready to record
+            self._rec_btn.setEnabled(True)
+            self._rec_btn.setStyleSheet(
+                "QPushButton{background:#1e1e26;color:#fa0;"
+                "border:1px solid #664400;padding:5px;font-weight:bold;}"
+                "QPushButton:hover{background:#2a2a3a;color:#fc4;}"
+            )
+            self._rec_btn.setText("REC")
+        else:
+            # Greyed out
+            self._rec_btn.setEnabled(False)
+            self._rec_btn.setStyleSheet(
+                "QPushButton{background:#1e1e26;color:#444;"
+                "border:1px solid #2a2a2a;padding:5px;font-weight:bold;}"
+            )
+            self._rec_btn.setText("REC")
 
     def _on_scene_changed(self, _idx):
         """Live-swap the simulator's scene and refresh the preview panel."""
@@ -1923,14 +2557,20 @@ class DroneDetector(QMainWindow):
         if old_stage == EngineStage.IDLE and target_stage > EngineStage.IDLE:
             src = (self.source_combo.currentText()
                    if hasattr(self, "source_combo") else "Hardware")
-            ok = (self._connect_simulator(target_stage)
-                  if src == "Simulator" else self._connect_hardware(target_stage))
+            if src == "Simulator":
+                ok = self._connect_simulator(target_stage)
+            elif src == "Replay":
+                ok = self._connect_replay(target_stage)
+            else:
+                ok = self._connect_hardware(target_stage)
             if not ok:
                 self._stage = EngineStage.IDLE
                 self._refresh_stage_buttons()
+                self._update_rec_button()
                 return
             self._stage = target_stage
             self._refresh_stage_buttons()
+            self._update_rec_button()
             return
 
         # Active → Idle: full teardown.
@@ -1938,6 +2578,7 @@ class DroneDetector(QMainWindow):
             self._disconnect()
             self._stage = EngineStage.IDLE
             self._refresh_stage_buttons()
+            self._update_rec_button()
             return
 
         # Active → active: keep connection, just flip engine.stage.
@@ -1952,6 +2593,7 @@ class DroneDetector(QMainWindow):
             self._engine.set_stage(target_stage)
         self._stage = target_stage
         self._refresh_stage_buttons()
+        self._update_rec_button()
 
     def _refresh_stage_buttons(self):
         """Repaint the segmented control: active stage + all to its left filled."""

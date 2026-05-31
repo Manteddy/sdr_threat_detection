@@ -105,6 +105,13 @@ class InferenceCfg:
 
 
 @dataclass
+class ExperimentsCfg:
+    root: str = "experiments"
+    heatmap_snapshot_hz: float = 1.0
+    max_queue_frames: int = 256
+
+
+@dataclass
 class EngineConfig:
     frequency_range: FrequencyRangeCfg = field(default_factory=FrequencyRangeCfg)
     hardware: HardwareCfg = field(default_factory=HardwareCfg)
@@ -116,6 +123,7 @@ class EngineConfig:
     priority_bands: List[PriorityBandCfg] = field(default_factory=list)
     bayesian: BayesianCfg = field(default_factory=BayesianCfg)
     inference: InferenceCfg = field(default_factory=InferenceCfg)
+    experiments: ExperimentsCfg = field(default_factory=ExperimentsCfg)
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +271,15 @@ def load_config(yaml_path: str | None = None) -> EngineConfig:
     cfg.inference = InferenceCfg(
         enabled=bool(inf.get("enabled", False)),
         weight=float(inf.get("weight", 1.0)),
+    )
+
+    ex = raw.get("experiments", {})
+    cfg.experiments = ExperimentsCfg(
+        root=str(ex.get("root", cfg.experiments.root)),
+        heatmap_snapshot_hz=float(ex.get("heatmap_snapshot_hz",
+                                         cfg.experiments.heatmap_snapshot_hz)),
+        max_queue_frames=int(ex.get("max_queue_frames",
+                                    cfg.experiments.max_queue_frames)),
     )
 
     return cfg

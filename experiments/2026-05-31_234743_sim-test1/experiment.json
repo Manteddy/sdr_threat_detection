@@ -1,0 +1,109 @@
+{
+  "name": "sim-test1",
+  "comment": "",
+  "start_ts": 1780260463.8982248,
+  "stop_ts": 1780260474.8338351,
+  "duration_s": 10.935610294342041,
+  "processor": "classic",
+  "iq_dtype": "int16",
+  "iq_frames": 336,
+  "heatmap_frames": 10,
+  "dropped_frames": 0,
+  "engine_config": {
+    "frequency_range": {
+      "start_hz": 1200000000.0,
+      "stop_hz": 6000000000.0,
+      "base_cell_bw_hz": 20000000.0
+    },
+    "hardware": {
+      "default_bandwidth_hz": 40000000.0,
+      "sample_rate_hz": 40000000.0,
+      "fft_size_base": 512,
+      "adc_full_scale": 2048.0,
+      "pll_settle_s": 0.0008,
+      "overlap_fraction": 0.0
+    },
+    "coarse_scan": {
+      "fft_size": 512,
+      "num_frames": 1,
+      "dwell_s": 0.003
+    },
+    "fine_scan": {
+      "fft_size": 4096,
+      "num_frames": 16,
+      "dwell_s": 0.03,
+      "welch_overlap": 0.5
+    },
+    "cfar": {
+      "guard_cells": 4,
+      "training_cells": 24,
+      "threshold_offset_db": 6.0,
+      "min_region_bw_hz": 100000.0
+    },
+    "scheduler": {
+      "tracked_revisit_s": 0.05,
+      "active_revisit_s": 0.1,
+      "suspect_revisit_s": 0.2,
+      "default_max_revisit_s": 5.0,
+      "priority_max_revisit_s": 0.5,
+      "short_coarse_dwell_s": 0.001,
+      "coarse_dwell_s": 0.003,
+      "fine_dwell_s": 0.03,
+      "active_dwell_s": 0.02,
+      "track_dwell_s": 0.01
+    },
+    "states": {
+      "suspect_prob_threshold": 0.35,
+      "active_prob_threshold": 0.65,
+      "confirmed_track_prob_threshold": 0.7,
+      "quiet_prob_threshold": 0.15,
+      "node_zoom_prob_threshold": 0.35,
+      "node_zoom_delta_threshold_db": 8.0,
+      "node_uncertainty_threshold": 0.7,
+      "occupied_bin_fraction_threshold": 0.15
+    },
+    "priority_bands": [
+      {
+        "name": "1.2G",
+        "start_hz": 1200000000.0,
+        "stop_hz": 1350000000.0,
+        "priority_weight": 1.5,
+        "max_revisit_s": 1.0
+      },
+      {
+        "name": "2.4G",
+        "start_hz": 2300000000.0,
+        "stop_hz": 2500000000.0,
+        "priority_weight": 2.0,
+        "max_revisit_s": 0.5
+      },
+      {
+        "name": "5.8G",
+        "start_hz": 5650000000.0,
+        "stop_hz": 5950000000.0,
+        "priority_weight": 2.0,
+        "max_revisit_s": 0.5
+      }
+    ],
+    "bayesian": {
+      "enabled": false,
+      "weight": 1.0
+    },
+    "inference": {
+      "enabled": false,
+      "weight": 1.0
+    },
+    "experiments": {
+      "root": "experiments",
+      "heatmap_snapshot_hz": 1.0,
+      "max_queue_frames": 256
+    }
+  },
+  "hardware": {
+    "sample_rate_hz": 40000000.0,
+    "bandwidth_hz": 40000000.0,
+    "adc_full_scale": 2048.0,
+    "min_hz": 70000000.0,
+    "max_hz": 6000000000.0
+  }
+}
